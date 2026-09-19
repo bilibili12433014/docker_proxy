@@ -1,0 +1,14 @@
+pip install asyncssh docker Flask PyYAML
+
+apt install python3-asyncssh python3-docker python3-flask python3-yaml
+
+https://docs.docker.com/engine/install/ubuntu/#install-using-the-repository
+
+vim /etc/docker/daemon.json
+
+{
+  "registry-mirrors": [
+    "https://docker.1panel.live",
+    "https://docker.mirrors.ustc.edu.cn"
+  ]
+}

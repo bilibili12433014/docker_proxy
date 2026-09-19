@@ -1,0 +1,5 @@
+config.yaml
+key_dir/
+__pycache__/
+*.py[cod]
+.venv/

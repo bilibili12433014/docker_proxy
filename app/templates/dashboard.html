@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}控制台 · Docker Proxy{% endblock %}
+{% block header %}
+<header class="topbar">
+    <div>
+        <p class="eyebrow">SECURE CONTAINER ACCESS</p>
+        <h1>Docker Proxy</h1>
+    </div>
+    <div class="topbar-actions">
+        <span class="docker-state {{ 'state-ok' if docker_ok else 'state-error' }}">
+            <span class="state-dot"></span>{{ 'Docker 在线' if docker_ok else 'Docker 离线' }}
+        </span>
+        <form method="post" action="{{ url_for('logout') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="button button-ghost" type="submit">退出</button>
+        </form>
+    </div>
+</header>
+{% endblock %}
+{% block content %}
+<main>
+    {% if not docker_ok %}
+        <div class="notice"><strong>Docker 无法连接：</strong>{{ docker_message }}</div>
+    {% endif %}
+
+    <section class="panel create-panel">
+        <div>
+            <p class="eyebrow">NEW WORKSPACE</p>
+            <h2>创建用户实例</h2>
+            <p class="muted">创建后会生成专属 SSH 密钥和一个停止状态的容器。</p>
+        </div>
+        <form method="post" action="{{ url_for('create_user') }}" class="create-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div>
+                <label for="username">用户名</label>
+                <input id="username" name="username" placeholder="alice" pattern="[a-z_][a-z0-9_-]{0,31}" maxlength="32" required>
+            </div>
+            <div>
+                <label for="image">Docker 镜像</label>
+                <input id="image" name="image" value="{{ default_image }}" maxlength="255" required>
+            </div>
+            <button class="button button-primary" type="submit">创建用户</button>
+        </form>
+    </section>
+
+    <section class="section-heading">
+        <div>
+            <p class="eyebrow">MANAGED INSTANCES</p>
+            <h2>用户与容器</h2>
+        </div>
+        <span class="count">{{ users|length }} 个用户</span>
+    </section>
+
+    {% if users %}
+        <div class="user-grid">
+            {% for item in users %}
+                {% set user = item.record %}
+                <article class="user-card {{ 'disabled-card' if not user.active }}">
+                    <div class="card-head">
+                        <div>
+                            <div class="identity-line">
+                                <h3>{{ user.username }}</h3>
+                                <span class="badge {{ 'badge-active' if user.active else 'badge-disabled' }}">{{ '已启用' if user.active else '已停用' }}</span>
+                                <span class="badge status-{{ item.status }}">{{ item.status }}</span>
+                            </div>
+                            <p class="image-name">{{ user.image }}</p>
+                        </div>
+                        <code class="container-id">{{ user.container_id[:12] }}</code>
+                    </div>
+
+                    <div class="data-path"><span>数据目录</span><code>/data/{{ user.username }} → /data</code></div>
+
+                    <div class="command-block">
+                        <div class="command-head">
+                            <span>PowerShell</span>
+                            <button class="copy-button" type="button" data-copy-target="ps-{{ user.username }}">复制</button>
+                        </div>
+                        <code id="ps-{{ user.username }}">{{ item.powershell }}</code>
+                    </div>
+
+                    <div class="command-block">
+                        <div class="command-head">
+                            <span>BAT / CMD</span>
+                            <button class="copy-button" type="button" data-copy-target="bat-{{ user.username }}">复制</button>
+                        </div>
+                        <code id="bat-{{ user.username }}">{{ item.batch }}</code>
+                    </div>
+
+                    <div class="card-actions">
+                        <a class="button button-secondary" href="{{ url_for('download_key', username=user.username) }}">下载私钥</a>
+                        <a class="button button-secondary" href="{{ url_for('download_bundle', username=user.username) }}">下载一键登录包</a>
+                        {% if user.active %}
+                            <form method="post" action="{{ url_for('start_user', username=user.username) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="button button-success" type="submit" {{ 'disabled' if item.status == 'running' }}>启动</button>
+                            </form>
+                            <form method="post" action="{{ url_for('stop_user', username=user.username) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="button button-warning" type="submit" {{ 'disabled' if item.status != 'running' }}>停止</button>
+                            </form>
+                            <form method="post" action="{{ url_for('disable_user', username=user.username) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="button button-danger" type="submit">停用用户</button>
+                            </form>
+                        {% else %}
+                            <form method="post" action="{{ url_for('enable_user', username=user.username) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="button button-success" type="submit">启用用户</button>
+                            </form>
+                        {% endif %}
+                    </div>
+                </article>
+            {% endfor %}
+        </div>
+    {% else %}
+        <div class="empty-state">
+            <div class="empty-icon">⌁</div>
+            <h3>尚未创建用户</h3>
+            <p>在上方填写用户名与镜像，创建第一个隔离实例。</p>
+        </div>
+    {% endif %}
+</main>
+{% endblock %}

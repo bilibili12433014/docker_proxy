@@ -1,0 +1,18 @@
+services:
+  docker-proxy:
+    build:
+      context: ..
+      dockerfile: app/Dockerfile
+    container_name: docker-proxy-manager
+    restart: unless-stopped
+    init: true
+    ports:
+      - "2221:2221"
+      - "2222:2222"
+    environment:
+      DOCKER_PROXY_CONFIG: /workspace/config.yaml
+    working_dir: /workspace
+    volumes:
+      - ..:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /data:/data

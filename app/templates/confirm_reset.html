@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}确认重置 · Docker Proxy{% endblock %}
+{% block content %}
+<main class="login-layout">
+    <section class="login-card">
+        <div class="brand-mark">!</div>
+        <p class="eyebrow">CONTAINER CONFLICT</p>
+        <h1>发现同名容器</h1>
+        <p class="muted">用户 {{ username }} 对应的旧容器仍然存在。确认后会删除旧容器并使用 {{ image }} 重新创建，宿主机 /data/{{ username }} 中的数据会保留。</p>
+        <div class="data-path"><span>容器</span><code>{{ instance.name }}</code></div>
+        <div class="data-path"><span>容器 ID</span><code>{{ instance.container_id[:12] }}</code></div>
+        <div class="data-path"><span>原镜像</span><code>{{ instance.image }}</code></div>
+        <div class="data-path"><span>当前状态</span><code>{{ instance.status }}</code></div>
+        <form method="post" action="{{ url_for('create_user') }}" class="form-stack">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="username" value="{{ username }}">
+            <input type="hidden" name="image" value="{{ image }}">
+            <input type="hidden" name="reset_existing" value="yes">
+            <button class="button button-danger button-wide" type="submit">删除旧容器并重建</button>
+            <a class="button button-secondary button-wide" href="{{ url_for('dashboard') }}">取消</a>
+        </form>
+    </section>
+</main>
+{% endblock %}

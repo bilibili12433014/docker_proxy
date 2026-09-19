@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}首次设置 · Docker Proxy{% endblock %}
+{% block content %}
+<main class="login-layout">
+    <section class="login-card">
+        <div class="brand-mark">DP</div>
+        <p class="eyebrow">FIRST START</p>
+        <h1>初始化管理端</h1>
+        <p class="muted">首次启动尚无配置，请设置管理密码和 SSH 公网域名。保存后会在项目根目录生成 config.yaml。</p>
+        <form method="post" class="form-stack">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label for="hostname">SSH 公网域名</label>
+            <input id="hostname" name="hostname" placeholder="ssh.example.com" autocomplete="url" required>
+            <label for="password">管理密码</label>
+            <input id="password" name="password" type="password" autocomplete="new-password" required>
+            <label for="confirmation">确认管理密码</label>
+            <input id="confirmation" name="confirmation" type="password" autocomplete="new-password" required>
+            <button class="button button-primary button-wide" type="submit">保存并进入控制台</button>
+        </form>
+    </section>
+</main>
+{% endblock %}

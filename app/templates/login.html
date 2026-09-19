@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}登录 · Docker Proxy{% endblock %}
+{% block content %}
+<main class="login-layout">
+    <section class="login-card">
+        <div class="brand-mark">DP</div>
+        <p class="eyebrow">SECURE CONTAINER ACCESS</p>
+        <h1>Docker Proxy</h1>
+        <p class="muted">使用配置文件中的管理密码进入控制台。</p>
+        <form method="post" class="form-stack">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label for="password">管理密码</label>
+            <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+            <button class="button button-primary button-wide" type="submit">登录控制台</button>
+        </form>
+    </section>
+</main>
+{% endblock %}
