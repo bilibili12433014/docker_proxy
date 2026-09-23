@@ -5,12 +5,21 @@
     <section class="login-card">
         <div class="brand-mark">!</div>
         <p class="eyebrow">CONTAINER CONFLICT</p>
-        <h1>发现同名容器</h1>
-        <p class="muted">用户 {{ username }} 对应的旧容器仍然存在。确认后会删除旧容器并使用 {{ image }} 重新创建，宿主机 /data/{{ username }} 中的数据会保留。</p>
+        <h1>发现同名受管容器</h1>
+        <p class="muted">无论配置中是否已有用户 {{ username }}，都可以直接复用这个容器并重置 SSH 密钥；也可以删除容器后按当前选项重建。</p>
         <div class="data-path"><span>容器</span><code>{{ instance.name }}</code></div>
         <div class="data-path"><span>容器 ID</span><code>{{ instance.container_id[:12] }}</code></div>
         <div class="data-path"><span>原镜像</span><code>{{ instance.image }}</code></div>
         <div class="data-path"><span>当前状态</span><code>{{ instance.status }}</code></div>
+        <div class="data-path"><span>现有 GPU</span><code>{{ instance.gpu_ids|join(', ') if instance.gpu_ids else '不分配 GPU' }}</code></div>
+        <form method="post" action="{{ url_for('create_user') }}" class="form-stack">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="username" value="{{ username }}">
+            <input type="hidden" name="image" value="{{ instance.image }}">
+            <input type="hidden" name="reuse_existing" value="yes">
+            <button class="button button-primary button-wide" type="submit">复用容器并重置 SSH 密钥</button>
+        </form>
+        <p class="muted action-explanation">复用会保留容器、可写层、运行状态和 GPU 分配，并在 YAML 中创建或修复该用户记录。</p>
         <div class="data-path"><span>新 GPU 分配</span><code>{{ gpu_ids|join(', ') if gpu_ids else '不分配 GPU' }}</code></div>
         <form method="post" action="{{ url_for('create_user') }}" class="form-stack">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -21,8 +30,9 @@
             {% endfor %}
             <input type="hidden" name="reset_existing" value="yes">
             <button class="button button-danger button-wide" type="submit">删除旧容器并重建</button>
-            <a class="button button-secondary button-wide" href="{{ url_for('dashboard') }}">取消</a>
         </form>
+        <p class="muted action-explanation">重建会保留宿主机 /data/{{ username }}，但容器可写层中的其他内容会被删除。</p>
+        <a class="button button-secondary button-wide" href="{{ url_for('dashboard') }}">取消</a>
     </section>
 </main>
 {% endblock %}

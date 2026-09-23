@@ -129,17 +129,10 @@
                         </div>
                     {% endif %}
 
-                    <div class="command-block">
-                        <div class="command-head">
-                            <span>BAT / CMD</span>
-                            <button class="copy-button" type="button" data-copy-target="bat-{{ user.username }}">复制</button>
-                        </div>
-                        <code id="bat-{{ user.username }}">{{ item.batch }}</code>
-                    </div>
-
                     <div class="card-actions">
                         <a class="button button-secondary" href="{{ url_for('download_key', username=user.username) }}">下载私钥</a>
                         <a class="button button-secondary" href="{{ url_for('download_bundle', username=user.username) }}">下载一键登录包</a>
+                        <a class="button button-secondary" href="{{ url_for('configure_gpu', username=user.username) }}">修改 GPU</a>
                         {% if user.active %}
                             <form method="post" action="{{ url_for('start_user', username=user.username) }}">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

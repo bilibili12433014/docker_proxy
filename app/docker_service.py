@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import secrets
 import subprocess
 import threading
 import time
@@ -32,6 +33,7 @@ class ExistingInstance:
     image: str
     status: str
     managed: bool
+    gpu_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -88,15 +90,21 @@ class DockerService:
         )
 
     def create_instance(
-        self, username: str, image: str, gpu_ids: tuple[str, ...]
+        self,
+        username: str,
+        image: str,
+        gpu_ids: tuple[str, ...],
+        container_name: str | None = None,
     ) -> str:
         client = self.client()
-        container_name = f"{self.settings.container_name_prefix}{username}"
+        resolved_name = container_name or (
+            f"{self.settings.container_name_prefix}{username}"
+        )
         logger.info(
             "开始创建容器 username=%s image=%s container=%s gpu_ids=%s",
             username,
             image,
-            container_name,
+            resolved_name,
             gpu_ids,
         )
         try:
@@ -121,7 +129,7 @@ class DockerService:
         data_dir.mkdir(parents=True, exist_ok=True)
         logger.debug(
             "调用 Docker 创建容器 container=%s image=%s storage_size=%s gpu_ids=%s volume=%s:/data:rw",
-            container_name,
+            resolved_name,
             image,
             self.settings.container_storage_size,
             gpu_ids,
@@ -130,7 +138,7 @@ class DockerService:
         device_requests = self._device_requests(gpu_ids)
         container = client.containers.create(
             image=image,
-            name=container_name,
+            name=resolved_name,
             hostname=username,
             entrypoint=[],
             command=list(self.settings.container_command),
@@ -149,10 +157,83 @@ class DockerService:
         logger.info(
             "容器创建完成 username=%s container=%s id=%s",
             username,
-            container_name,
+            resolved_name,
             container.id,
         )
         return container.id
+
+    def recreate_instance(
+        self,
+        username: str,
+        image: str,
+        container_id: str,
+        gpu_ids: tuple[str, ...],
+    ) -> str:
+        client = self.client()
+        old_container = client.containers.get(container_id)
+        old_container.reload()
+        was_running = old_container.status == "running"
+        canonical_name = f"{self.settings.container_name_prefix}{username}"
+        suffix = secrets.token_hex(4)
+        replacement_name = f"{canonical_name}-replacement-{suffix}"
+        backup_name = f"{canonical_name}-backup-{suffix}"
+        replacement_id = self.create_instance(
+            username,
+            image,
+            gpu_ids,
+            container_name=replacement_name,
+        )
+        replacement = client.containers.get(replacement_id)
+        old_renamed = False
+        replacement_promoted = False
+        try:
+            if was_running:
+                old_container.stop(timeout=10)
+            old_container.rename(backup_name)
+            old_renamed = True
+            replacement.rename(canonical_name)
+            replacement_promoted = True
+            if was_running:
+                replacement.start()
+        except DockerException:
+            logger.exception(
+                "替换容器失败，开始回滚 username=%s old=%s replacement=%s",
+                username,
+                old_container.id,
+                replacement.id,
+            )
+            if replacement_promoted:
+                try:
+                    replacement.rename(replacement_name)
+                except DockerException:
+                    logger.exception("回滚新容器名称失败 id=%s", replacement.id)
+            if old_renamed:
+                try:
+                    old_container.rename(canonical_name)
+                except DockerException:
+                    logger.exception("恢复旧容器名称失败 id=%s", old_container.id)
+            try:
+                replacement.remove(force=True)
+            except DockerException:
+                logger.exception("清理替换容器失败 id=%s", replacement.id)
+            if was_running:
+                try:
+                    old_container.start()
+                except DockerException:
+                    logger.exception("恢复旧容器运行状态失败 id=%s", old_container.id)
+            raise
+        try:
+            old_container.remove(force=True)
+        except DockerException:
+            logger.exception("清理旧容器失败 id=%s name=%s", old_container.id, backup_name)
+        logger.warning(
+            "容器已重建 username=%s old_id=%s new_id=%s gpu_ids=%s",
+            username,
+            old_container.id,
+            replacement.id,
+            gpu_ids,
+        )
+        return replacement.id
 
     def gpu_inventory(self) -> tuple[tuple[GPUDevice, ...], str | None]:
         with self._gpu_lock:
@@ -298,23 +379,39 @@ class DockerService:
             labels.get("docker-proxy.managed") == "true"
             and labels.get("docker-proxy.username") == username
         )
+        gpu_ids = self._gpu_ids_from_host_config(container.attrs.get("HostConfig") or {})
         instance = ExistingInstance(
             container_id=container.id,
             name=container.name,
             image=image,
             status=status,
             managed=managed,
+            gpu_ids=gpu_ids,
         )
         logger.warning(
-            "发现同名容器 username=%s container=%s id=%s image=%s status=%s managed=%s",
+            "发现同名容器 username=%s container=%s id=%s image=%s status=%s managed=%s gpu_ids=%s",
             username,
             instance.name,
             instance.container_id,
             instance.image,
             instance.status,
             instance.managed,
+            instance.gpu_ids,
         )
         return instance
+
+    @staticmethod
+    def _gpu_ids_from_host_config(host_config: dict[str, Any]) -> tuple[str, ...]:
+        for device_request in host_config.get("DeviceRequests") or []:
+            capabilities = device_request.get("Capabilities") or []
+            if not any("gpu" in group for group in capabilities):
+                continue
+            device_ids = tuple(str(value) for value in device_request.get("DeviceIDs") or [])
+            if device_ids:
+                return device_ids
+            if int(device_request.get("Count") or 0) == -1:
+                return ("all",)
+        return ()
 
     def status(self, container_id: str) -> str:
         try:

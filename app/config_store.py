@@ -90,6 +90,62 @@ class ConfigStore:
             self._write(data)
         return record
 
+    def reuse_user(
+        self,
+        username: str,
+        image: str,
+        container_id: str,
+        public_key: str,
+        gpu_ids: tuple[str, ...],
+    ) -> UserRecord:
+        with self._lock:
+            data = self._read()
+            users = self._users_mapping(data)
+            previous = users.get(username)
+            created_at = (
+                self._record(username, previous).created_at
+                if previous is not None
+                else datetime.now(UTC).isoformat()
+            )
+            record = UserRecord(
+                username=username,
+                image=image,
+                container_id=container_id,
+                public_key=public_key,
+                gpu_ids=gpu_ids,
+                active=True,
+                created_at=created_at,
+            )
+            users[username] = self._serialize(record)
+            self._write(data)
+            return record
+
+    def update_instance(
+        self,
+        username: str,
+        container_id: str,
+        gpu_ids: tuple[str, ...],
+    ) -> UserRecord:
+        with self._lock:
+            data = self._read()
+            users = self._users_mapping(data)
+            value = users.get(username)
+            if value is None:
+                raise ValueError(f"用户 {username} 不存在")
+            previous = self._record(username, value)
+            record = UserRecord(
+                username=username,
+                image=previous.image,
+                container_id=container_id,
+                public_key=previous.public_key,
+                gpu_ids=gpu_ids,
+                active=previous.active,
+                created_at=previous.created_at,
+            )
+            users[username] = self._serialize(record)
+            self._write(data)
+            return record
+
     def get_user(self, username: str) -> UserRecord | None:
         with self._lock:
             users = self._read_users()
@@ -119,19 +175,6 @@ class ConfigStore:
             value["active"] = active
             self._write(data)
         return True
-
-    def reset_public_key(self, username: str, public_key: str) -> UserRecord:
-        with self._lock:
-            data = self._read()
-            users = self._users_mapping(data)
-            value = users.get(username)
-            if value is None:
-                raise ValueError(f"用户 {username} 不存在")
-            self._record(username, value)
-            value["public_key"] = public_key
-            value["active"] = True
-            self._write(data)
-            return self._record(username, value)
 
     def _read_users(self) -> dict[str, dict[str, Any]]:
         return self._users_mapping(self._read())

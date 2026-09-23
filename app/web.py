@@ -57,14 +57,6 @@ def powershell_command(
     )
 
 
-def batch_command(username: str, hostname: str) -> str:
-    key_name = f"id_ed25519_{username}"
-    install = "where cloudflared >nul 2>nul || winget install --id Cloudflare.cloudflared -e --source winget --accept-source-agreements --accept-package-agreements"
-    permissions = f'icacls ".\\{key_name}" /inheritance:r >nul && icacls ".\\{key_name}" /grant:r "%USERDOMAIN%\\%USERNAME%:R" >nul'
-    connect = f'ssh -i ".\\{key_name}" -o IdentitiesOnly=yes -o "ProxyCommand=cloudflared access ssh --hostname %h" {username}@{hostname}'
-    return f"{install} & {permissions} && {connect}"
-
-
 def batch_script(username: str, hostname: str) -> str:
     return "\r\n".join(
         [
@@ -233,7 +225,6 @@ def create_app(
                         if private_path.is_file()
                         else ""
                     ),
-                    "batch": batch_command(user.username, hostname),
                 }
             )
         return render_template(
@@ -254,10 +245,11 @@ def create_app(
         username = request.form.get("username", "").strip()
         image = request.form.get("image", "").strip()
         logger.info(
-            "收到创建用户请求 username=%s image=%s reuse_existing=%s",
+            "收到创建用户请求 username=%s image=%s reuse_existing=%s reset_existing=%s",
             username,
             image,
             request.form.get("reuse_existing"),
+            request.form.get("reset_existing"),
         )
         if not USERNAME_RE.fullmatch(username):
             logger.warning("创建用户校验失败 username=%s 原因=用户名格式无效", username)
@@ -276,82 +268,106 @@ def create_app(
             return redirect(url_for("dashboard"))
         with create_lock:
             stored_user = store.get_user(username)
-            if stored_user is not None:
-                existing = docker_service.existing_instance(username)
-                if (
-                    existing is None
-                    or not existing.managed
-                    or existing.container_id != stored_user.container_id
-                ):
-                    logger.error(
-                        "无法复用用户实例 username=%s configured_container=%s existing=%s",
-                        username,
-                        stored_user.container_id,
-                        existing,
-                    )
-                    flash("用户配置存在，但对应的受管容器不匹配，无法安全复用", "error")
-                    return redirect(url_for("dashboard"))
-                if request.form.get("reuse_existing") != "yes":
-                    return render_template(
-                        "confirm_reuse.html",
-                        user=stored_user,
-                        instance=existing,
-                    )
-                try:
-                    user_key = key_manager.reset_user_key(username)
-                    store.reset_public_key(username, user_key.public_key)
-                except (OSError, TypeError, ValueError) as exc:
-                    logger.exception("复用实例并重置密钥失败 username=%s", username)
-                    flash(f"复用实例失败: {exc}", "error")
-                    return redirect(url_for("dashboard"))
-                logger.warning(
-                    "已复用容器并重置 SSH 密钥 username=%s container_id=%s",
-                    username,
-                    existing.container_id,
-                )
-                flash(f"已复用 {username} 的容器并重置 SSH 密钥，旧密钥立即失效", "success")
-                return redirect(url_for("dashboard"))
             try:
-                gpu_ids = selected_gpu_ids()
-            except ValueError as exc:
-                flash(str(exc), "error")
+                existing = docker_service.existing_instance(username)
+            except DockerException as exc:
+                logger.exception("检查同名容器失败 username=%s", username)
+                flash(f"检查同名容器失败: {exc}", "error")
                 return redirect(url_for("dashboard"))
+            if existing is not None:
+                if not existing.managed:
+                    logger.error(
+                        "拒绝操作非本项目容器 username=%s container=%s id=%s",
+                        username,
+                        existing.name,
+                        existing.container_id,
+                    )
+                    flash(
+                        f"同名容器 {existing.name} 不是本项目创建的，请手动重命名或删除",
+                        "error",
+                    )
+                    return redirect(url_for("dashboard"))
+                if request.form.get("reuse_existing") == "yes":
+                    phase = "重置 SSH 密钥"
+                    try:
+                        logger.debug(
+                            "复用容器阶段 username=%s phase=%s container_id=%s",
+                            username,
+                            phase,
+                            existing.container_id,
+                        )
+                        user_key = key_manager.reset_user_key(username)
+                        phase = "保存用户配置"
+                        store.reuse_user(
+                            username,
+                            existing.image,
+                            existing.container_id,
+                            user_key.public_key,
+                            existing.gpu_ids,
+                        )
+                    except (OSError, TypeError, ValueError) as exc:
+                        logger.exception(
+                            "复用实例失败 username=%s container_id=%s phase=%s",
+                            username,
+                            existing.container_id,
+                            phase,
+                        )
+                        flash(f"复用实例失败: {exc}", "error")
+                        return redirect(url_for("dashboard"))
+                    logger.warning(
+                        "已复用容器并重置 SSH 密钥 username=%s container_id=%s config_existed=%s gpu_ids=%s",
+                        username,
+                        existing.container_id,
+                        stored_user is not None,
+                        existing.gpu_ids,
+                    )
+                    flash(
+                        f"已复用 {username} 的容器并重置 SSH 密钥，旧密钥立即失效",
+                        "success",
+                    )
+                    return redirect(url_for("dashboard"))
+                try:
+                    gpu_ids = selected_gpu_ids()
+                except ValueError as exc:
+                    flash(str(exc), "error")
+                    return redirect(url_for("dashboard"))
+                if request.form.get("reset_existing") != "yes":
+                    logger.info(
+                        "等待用户选择复用或重建 username=%s container_id=%s config_existed=%s",
+                        username,
+                        existing.container_id,
+                        stored_user is not None,
+                    )
+                    store.set_last_image(image)
+                    return render_template(
+                        "confirm_reset.html",
+                        username=username,
+                        image=image,
+                        instance=existing,
+                        gpu_ids=gpu_ids,
+                    )
+            elif stored_user is not None:
+                logger.error(
+                    "用户配置存在但同名容器缺失 username=%s configured_container=%s",
+                    username,
+                    stored_user.container_id,
+                )
+                flash("用户配置存在，但同名受管容器已经缺失，无法复用", "error")
+                return redirect(url_for("dashboard"))
+            if existing is None:
+                try:
+                    gpu_ids = selected_gpu_ids()
+                except ValueError as exc:
+                    flash(str(exc), "error")
+                    return redirect(url_for("dashboard"))
             user_key = None
             container_id = None
-            phase = "检查同名容器"
+            phase = "准备创建"
             try:
-                logger.debug("创建用户阶段 username=%s phase=%s", username, phase)
-                existing = docker_service.existing_instance(username)
                 if existing is not None:
-                    if not existing.managed:
-                        logger.error(
-                            "拒绝重置非本项目容器 username=%s container=%s id=%s",
-                            username,
-                            existing.name,
-                            existing.container_id,
-                        )
-                        flash(
-                            f"同名容器 {existing.name} 不是本项目创建的，请手动重命名或删除",
-                            "error",
-                        )
-                        return redirect(url_for("dashboard"))
-                    if request.form.get("reset_existing") != "yes":
-                        logger.info(
-                            "等待用户确认重置 username=%s container_id=%s",
-                            username,
-                            existing.container_id,
-                        )
-                        store.set_last_image(image)
-                        return render_template(
-                            "confirm_reset.html",
-                            username=username,
-                            image=image,
-                            instance=existing,
-                            gpu_ids=gpu_ids,
-                        )
                     phase = "删除旧容器"
                     logger.warning(
-                        "用户确认重置 username=%s container_id=%s",
+                        "用户确认重建 username=%s container_id=%s",
                         username,
                         existing.container_id,
                     )
@@ -373,13 +389,22 @@ def create_app(
                 )
                 phase = "保存用户配置"
                 logger.debug("创建用户阶段 username=%s phase=%s", username, phase)
-                store.add_user(
-                    username,
-                    image,
-                    container_id,
-                    user_key.public_key,
-                    gpu_ids,
-                )
+                if stored_user is None:
+                    store.add_user(
+                        username,
+                        image,
+                        container_id,
+                        user_key.public_key,
+                        gpu_ids,
+                    )
+                else:
+                    store.reuse_user(
+                        username,
+                        image,
+                        container_id,
+                        user_key.public_key,
+                        gpu_ids,
+                    )
             except (DockerException, OSError, TypeError, ValueError) as exc:
                 logger.exception(
                     "创建用户失败 username=%s image=%s phase=%s",
@@ -411,6 +436,65 @@ def create_app(
             gpu_ids,
         )
         flash(f"用户 {username} 已创建，容器处于停止状态", "success")
+        return redirect(url_for("dashboard"))
+
+    @app.route("/users/<username>/gpu", methods=["GET", "POST"])
+    @login_required
+    def configure_gpu(username: str) -> Any:
+        user = require_user(store, username)
+        try:
+            gpu_devices, gpu_error = docker_service.gpu_inventory()
+        except DockerException as exc:
+            gpu_devices, gpu_error = (), str(exc)
+        if request.method == "GET":
+            return render_template(
+                "configure_gpu.html",
+                user=user,
+                gpu_devices=gpu_devices,
+                gpu_error=gpu_error,
+            )
+        try:
+            gpu_ids = selected_gpu_ids()
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("configure_gpu", username=username))
+        with create_lock:
+            user = require_user(store, username)
+            try:
+                existing = docker_service.existing_instance(username)
+                if (
+                    existing is None
+                    or not existing.managed
+                    or existing.container_id != user.container_id
+                ):
+                    flash("用户配置与同名受管容器不匹配，无法修改 GPU", "error")
+                    return redirect(url_for("dashboard"))
+                if existing.gpu_ids == gpu_ids:
+                    if user.gpu_ids != gpu_ids:
+                        store.update_instance(username, existing.container_id, gpu_ids)
+                    flash(f"{username} 的 GPU 分配没有变化", "success")
+                    return redirect(url_for("dashboard"))
+                logger.warning(
+                    "开始修改 GPU，容器将被重建 username=%s old_gpu_ids=%s new_gpu_ids=%s",
+                    username,
+                    existing.gpu_ids,
+                    gpu_ids,
+                )
+                container_id = docker_service.recreate_instance(
+                    username,
+                    user.image,
+                    user.container_id,
+                    gpu_ids,
+                )
+                store.update_instance(username, container_id, gpu_ids)
+            except (DockerException, OSError, TypeError, ValueError) as exc:
+                logger.exception("修改 GPU 失败 username=%s gpu_ids=%s", username, gpu_ids)
+                flash(f"修改 GPU 失败: {exc}", "error")
+                return redirect(url_for("configure_gpu", username=username))
+        flash(
+            f"{username} 的 GPU 分配已更新；/data 和 SSH 密钥已保留，容器可写层已重建",
+            "success",
+        )
         return redirect(url_for("dashboard"))
 
     @app.post("/users/<username>/start")
