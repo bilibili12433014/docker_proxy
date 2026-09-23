@@ -13,6 +13,7 @@ HOSTNAME_RE = re.compile(
 )
 ADMIN_PASSWORD_RE = re.compile(r"^[\x21-\x7E]+$")
 DEFAULT_IMAGE = "ubuntu:26.04"
+DEFAULT_CONTAINER_STORAGE_SIZE = "20G"
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class Settings:
     ssh_port: int
     key_dir: Path
     data_root: Path
+    container_storage_size: str
     container_name_prefix: str
     container_command: tuple[str, ...]
     secure_cookies: bool
@@ -56,6 +58,7 @@ class Settings:
             ssh_port=2222,
             key_dir=(config_path.parent / "key_dir").resolve(),
             data_root=Path("/data"),
+            container_storage_size=DEFAULT_CONTAINER_STORAGE_SIZE,
             container_name_prefix="docker-proxy-",
             container_command=(
                 "/bin/sh",
@@ -89,6 +92,11 @@ class Settings:
         prefix = str(raw.get("container_name_prefix", "docker-proxy-"))
         if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,64}", prefix):
             raise ValueError("container_name_prefix 包含无效字符")
+        storage_size = str(
+            raw.get("container_storage_size", DEFAULT_CONTAINER_STORAGE_SIZE)
+        ).upper()
+        if not re.fullmatch(r"[1-9][0-9]*[KMGT]", storage_size):
+            raise ValueError("container_storage_size 必须是带 K、M、G 或 T 单位的正整数")
         command = raw.get(
             "container_command",
             [
@@ -124,6 +132,7 @@ class Settings:
                 / "key_dir"
             ).resolve(),
             data_root=Path("/data"),
+            container_storage_size=storage_size,
             container_name_prefix=prefix,
             container_command=tuple(command),
             secure_cookies=bool(raw.get("secure_cookies", False)),
@@ -140,6 +149,7 @@ class Settings:
             "web_port": self.web_port,
             "ssh_port": self.ssh_port,
             "key_dir": "./key_dir",
+            "container_storage_size": self.container_storage_size,
             "container_name_prefix": self.container_name_prefix,
             "container_command": list(self.container_command),
             "last_image": DEFAULT_IMAGE,

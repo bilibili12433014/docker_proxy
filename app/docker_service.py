@@ -77,9 +77,10 @@ class DockerService:
         )
         data_dir.mkdir(parents=True, exist_ok=True)
         logger.debug(
-            "调用 Docker 创建容器 container=%s image=%s volume=%s:/data:rw",
+            "调用 Docker 创建容器 container=%s image=%s storage_size=%s volume=%s:/data:rw",
             container_name,
             image,
+            self.settings.container_storage_size,
             data_dir,
         )
         container = client.containers.create(
@@ -90,6 +91,7 @@ class DockerService:
             command=list(self.settings.container_command),
             user="0",
             working_dir="/data",
+            storage_opt={"size": self.settings.container_storage_size},
             volumes={str(data_dir): {"bind": "/data", "mode": "rw"}},
             labels={
                 "docker-proxy.managed": "true",

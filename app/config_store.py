@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from .config import DEFAULT_IMAGE
+from .config import DEFAULT_CONTAINER_STORAGE_SIZE, DEFAULT_IMAGE
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class ConfigStore:
         self.path = Path(path).resolve()
         self._lock = threading.RLock()
         if self.path.is_file():
-            self._remove_legacy_data_root()
+            self._migrate_config()
             self.list_users()
 
     def is_initialized(self) -> bool:
@@ -149,17 +149,26 @@ class ConfigStore:
         finally:
             temporary_path.unlink(missing_ok=True)
 
-    def _remove_legacy_data_root(self) -> None:
+    def _migrate_config(self) -> None:
         with self._lock:
             data = self._read()
-            if "data_root" not in data:
-                return
-            previous = data.pop("data_root")
-            self._write(data)
-            logger.info(
-                "已移除旧配置项 data_root=%s，用户数据目录固定为 /data",
-                previous,
-            )
+            changed = False
+            if "data_root" in data:
+                previous = data.pop("data_root")
+                changed = True
+                logger.info(
+                    "已移除旧配置项 data_root=%s，用户数据目录固定为 /data",
+                    previous,
+                )
+            if "container_storage_size" not in data:
+                data["container_storage_size"] = DEFAULT_CONTAINER_STORAGE_SIZE
+                changed = True
+                logger.info(
+                    "已添加配置项 container_storage_size=%s",
+                    DEFAULT_CONTAINER_STORAGE_SIZE,
+                )
+            if changed:
+                self._write(data)
 
     @staticmethod
     def _users_mapping(data: dict[str, Any]) -> dict[str, dict[str, Any]]:

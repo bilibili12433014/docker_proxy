@@ -35,37 +35,12 @@ F = TypeVar("F", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
 
 
-def powershell_command(username: str, hostname: str) -> str:
-    key_name = f"id_ed25519_{username}"
-    install = "if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) { winget install --id Cloudflare.cloudflared -e --source winget --accept-source-agreements --accept-package-agreements }"
-    permissions = f'$key = ".\\{key_name}"; $sid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value; icacls $key /inheritance:r | Out-Null; icacls $key /grant:r "*${{sid}}:R" | Out-Null'
-    connect = f'ssh -i $key -o IdentitiesOnly=yes -o "ProxyCommand=cloudflared access ssh --hostname %h" {username}@{hostname}'
-    return f"{install}; {permissions}; {connect}"
-
-
 def batch_command(username: str, hostname: str) -> str:
     key_name = f"id_ed25519_{username}"
     install = "where cloudflared >nul 2>nul || winget install --id Cloudflare.cloudflared -e --source winget --accept-source-agreements --accept-package-agreements"
     permissions = f'icacls ".\\{key_name}" /inheritance:r >nul && icacls ".\\{key_name}" /grant:r "%USERDOMAIN%\\%USERNAME%:R" >nul'
     connect = f'ssh -i ".\\{key_name}" -o IdentitiesOnly=yes -o "ProxyCommand=cloudflared access ssh --hostname %h" {username}@{hostname}'
     return f"{install} & {permissions} && {connect}"
-
-
-def powershell_script(username: str, hostname: str) -> str:
-    return "\r\n".join(
-        [
-            '$ErrorActionPreference = "Stop"',
-            "if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) {",
-            "    winget install --id Cloudflare.cloudflared -e --source winget --accept-source-agreements --accept-package-agreements",
-            "}",
-            '$key = Join-Path $PSScriptRoot "id_ed25519"',
-            "$sid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value",
-            "icacls $key /inheritance:r | Out-Null",
-            'icacls $key /grant:r "*${sid}:R" | Out-Null',
-            f'ssh -i $key -o IdentitiesOnly=yes -o "ProxyCommand=cloudflared access ssh --hostname %h" {username}@{hostname}',
-            "",
-        ]
-    )
 
 
 def batch_script(username: str, hostname: str) -> str:
@@ -199,7 +174,6 @@ def create_app(
                 {
                     "record": user,
                     "status": docker_service.status(user.container_id),
-                    "powershell": powershell_command(user.username, hostname),
                     "batch": batch_command(user.username, hostname),
                 }
             )
@@ -396,7 +370,6 @@ def create_app(
         hostname = store.public_hostname()
         with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("id_ed25519", private_path.read_bytes())
-            archive.writestr("login.ps1", powershell_script(username, hostname))
             archive.writestr("login.bat", batch_script(username, hostname))
         payload.seek(0)
         return send_file(

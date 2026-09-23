@@ -10,12 +10,13 @@ Docker Proxy 是一个基于 YAML 配置的轻量 Docker 用户管理与 SSH 网
 - 为每个用户生成独立的 Ed25519 SSH 密钥
 - 使用唯一用户名创建、启动、停止、启用或停用用户容器
 - 默认镜像为 `ubuntu:26.04`，并自动记住最近一次使用的镜像
+- 每个容器实例的可写层限制为 20GB，不包含单独挂载的 `/data`
 - 将宿主机 `/data/<username>` 固定映射到容器内的 `/data`
 - SSH 公钥认证成功后，通过 Docker Exec 以 root 身份进入用户容器，无需在镜像内运行 `sshd`
 - 交互登录自动进入持久化的 `workspace` tmux 会话
 - tmux 启用鼠标操作、彩色路径提示符和 100000 行历史记录
 - 缺少 tmux 时自动安装；Ubuntu 和 Debian 普通 APT 仓库使用清华 IPv4 镜像
-- 提供 PowerShell、BAT 登录命令以及包含私钥和登录脚本的 ZIP 下载
+- 提供 BAT/CMD 登录命令以及包含私钥和 `login.bat` 的 ZIP 下载
 - 创建用户遇到同名遗留容器时，网页会要求确认后再重置
 
 ## 运行要求
@@ -25,6 +26,8 @@ Docker Proxy 是一个基于 YAML 配置的轻量 Docker 用户管理与 SSH 网
 - 可写的宿主机目录：`/data`
 - TCP `2221` 和 `2222` 端口
 - 使用本地方式运行时需要 Python 3
+
+20GB 实例限制通过 Docker 的 `storage-opt size` 实现。使用 `overlay2` 时，Docker 数据目录的底层文件系统必须是启用了 `pquota` 的 XFS；不满足该条件时 Docker 会拒绝创建带容量限制的容器。
 
 用户镜像至少需要包含 `/bin/sh`。若镜像包含 `/bin/bash`，登录后会使用带颜色和当前路径的 Bash 提示符。
 
@@ -88,7 +91,9 @@ http://服务器地址:2221/
 4. 创建名为 `docker-proxy-<username>` 的容器并挂载数据目录。
 5. 将用户、镜像、容器 ID、公钥和状态写入 `config.yaml`。
 
-如果密钥目录或同名受管容器由此前失败的创建操作遗留，管理界面会提示确认重置。停用用户会同时阻止 SSH 登录并停止容器；重新启用后仍需按需启动容器。
+容器可写层上限为 `20G`，宿主机绑定挂载的 `/data/<username>` 不计入该限制。如果密钥目录或同名受管容器由此前失败的创建操作遗留，管理界面会提示确认重置。停用用户会同时阻止 SSH 登录并停止容器；重新启用后仍需按需启动容器。
+
+容量限制仅能在创建容器时设置。升级前已经存在的容器不会自动重建，也不会自动获得 20GB 限制；需要保留 `/data/<username>` 后重新创建对应实例。
 
 ## SSH 登录
 
@@ -100,13 +105,13 @@ ssh -p 2222 -i id_ed25519_<username> <username>@<服务器地址>
 
 管理页面也可以复制 Cloudflare 登录命令，或下载一键登录包。Windows 登录脚本会在缺少 `cloudflared` 时执行：
 
-```powershell
+```bat
 winget install Cloudflare.cloudflared
 ```
 
 随后使用以下形式连接：
 
-```powershell
+```bat
 ssh -i ".\id_ed25519_<username>" -o IdentitiesOnly=yes -o "ProxyCommand=cloudflared access ssh --hostname %h" <username>@<SSH公网域名>
 ```
 
@@ -135,6 +140,7 @@ ingress:
 - SSH 公网域名
 - 管理端口 `2221` 和 SSH 端口 `2222`
 - 固定的 `key_dir: ./key_dir`
+- 容器可写层容量 `container_storage_size: 20G`
 - 容器名称前缀和保活命令
 - 最近一次使用的 Docker 镜像
 - 用户、镜像、容器 ID、公钥、启用状态和创建时间
