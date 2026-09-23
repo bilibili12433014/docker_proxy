@@ -23,6 +23,17 @@
         <div class="notice"><strong>Docker 无法连接：</strong>{{ docker_message }}</div>
     {% endif %}
 
+    {% if host_info %}
+        <section class="host-info">
+            <span>存储驱动 <strong>{{ host_info.storage_driver }}</strong></span>
+            <span>底层文件系统 <strong>{{ host_info.backing_filesystem }}</strong></span>
+            <span>Docker Root <strong>{{ host_info.docker_root_dir }}</strong></span>
+            <span>默认 Runtime <strong>{{ host_info.default_runtime }}</strong></span>
+            <span>NVIDIA Runtime <strong class="{{ 'state-ok' if 'nvidia' in host_info.runtimes else 'state-error' }}">{{ '已注册' if 'nvidia' in host_info.runtimes else '未注册' }}</strong></span>
+            <span>识别显卡 <strong>{{ gpu_devices|length }} 张</strong></span>
+        </section>
+    {% endif %}
+
     <section class="panel create-panel">
         <div>
             <p class="eyebrow">NEW WORKSPACE</p>
@@ -39,7 +50,33 @@
                 <label for="image">Docker 镜像</label>
                 <input id="image" name="image" value="{{ default_image }}" maxlength="255" required>
             </div>
-            <button class="button button-primary" type="submit">创建用户</button>
+            <fieldset class="gpu-picker">
+                <legend>GPU 分配</legend>
+                {% if gpu_devices %}
+                    <div class="gpu-summary">检测到 {{ gpu_devices|length }} 张 NVIDIA 显卡，默认全部分配</div>
+                    <div class="gpu-options">
+                        {% for gpu in gpu_devices %}
+                            <label class="gpu-option">
+                                <input type="checkbox" name="gpu_ids" value="{{ gpu.device_id }}" checked>
+                                <span>
+                                    <strong>GPU {{ gpu.index }} · {{ gpu.name }}</strong>
+                                    <small>{{ gpu.memory_mb }} MiB · {{ gpu.device_id }}</small>
+                                </span>
+                            </label>
+                        {% endfor %}
+                    </div>
+                {% else %}
+                    <div class="gpu-summary gpu-error">{{ gpu_error or '未检测到 NVIDIA GPU' }}</div>
+                    <label class="gpu-option">
+                        <input type="checkbox" name="gpu_ids" value="all" checked>
+                        <span>
+                            <strong>全部可用 GPU</strong>
+                            <small>无法枚举显卡时仍提交全部 GPU 请求</small>
+                        </span>
+                    </label>
+                {% endif %}
+            </fieldset>
+            <button class="button button-primary create-submit" type="submit">创建用户</button>
         </form>
     </section>
 
@@ -69,6 +106,28 @@
                     </div>
 
                     <div class="data-path"><span>数据目录</span><code>/data/{{ user.username }} → /data</code></div>
+                    <div class="data-path">
+                        <span>GPU</span>
+                        <code>
+                            {% if not user.gpu_ids %}
+                                未分配
+                            {% elif 'all' in user.gpu_ids %}
+                                全部 GPU
+                            {% else %}
+                                {{ user.gpu_ids|length }} 张 · {{ user.gpu_ids|join(', ') }}
+                            {% endif %}
+                        </code>
+                    </div>
+
+                    {% if item.powershell %}
+                        <div class="command-block">
+                            <div class="command-head">
+                                <span>PowerShell 临时密钥登录</span>
+                                <button class="copy-button" type="button" data-copy-target="ps-{{ user.username }}">复制</button>
+                            </div>
+                            <code id="ps-{{ user.username }}">{{ item.powershell }}</code>
+                        </div>
+                    {% endif %}
 
                     <div class="command-block">
                         <div class="command-head">

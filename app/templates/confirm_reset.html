@@ -11,10 +11,14 @@
         <div class="data-path"><span>容器 ID</span><code>{{ instance.container_id[:12] }}</code></div>
         <div class="data-path"><span>原镜像</span><code>{{ instance.image }}</code></div>
         <div class="data-path"><span>当前状态</span><code>{{ instance.status }}</code></div>
+        <div class="data-path"><span>新 GPU 分配</span><code>{{ gpu_ids|join(', ') if gpu_ids else '不分配 GPU' }}</code></div>
         <form method="post" action="{{ url_for('create_user') }}" class="form-stack">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" name="username" value="{{ username }}">
             <input type="hidden" name="image" value="{{ image }}">
+            {% for gpu_id in gpu_ids %}
+                <input type="hidden" name="gpu_ids" value="{{ gpu_id }}">
+            {% endfor %}
             <input type="hidden" name="reset_existing" value="yes">
             <button class="button button-danger button-wide" type="submit">删除旧容器并重建</button>
             <a class="button button-secondary button-wide" href="{{ url_for('dashboard') }}">取消</a>

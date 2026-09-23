@@ -22,6 +22,7 @@ class UserRecord:
     image: str
     container_id: str
     public_key: str
+    gpu_ids: tuple[str, ...]
     active: bool
     created_at: str
 
@@ -63,7 +64,12 @@ class ConfigStore:
             self._write(data)
 
     def add_user(
-        self, username: str, image: str, container_id: str, public_key: str
+        self,
+        username: str,
+        image: str,
+        container_id: str,
+        public_key: str,
+        gpu_ids: tuple[str, ...],
     ) -> UserRecord:
         created_at = datetime.now(UTC).isoformat()
         record = UserRecord(
@@ -71,6 +77,7 @@ class ConfigStore:
             image=image,
             container_id=container_id,
             public_key=public_key,
+            gpu_ids=gpu_ids,
             active=True,
             created_at=created_at,
         )
@@ -112,6 +119,19 @@ class ConfigStore:
             value["active"] = active
             self._write(data)
         return True
+
+    def reset_public_key(self, username: str, public_key: str) -> UserRecord:
+        with self._lock:
+            data = self._read()
+            users = self._users_mapping(data)
+            value = users.get(username)
+            if value is None:
+                raise ValueError(f"用户 {username} 不存在")
+            self._record(username, value)
+            value["public_key"] = public_key
+            value["active"] = True
+            self._write(data)
+            return self._record(username, value)
 
     def _read_users(self) -> dict[str, dict[str, Any]]:
         return self._users_mapping(self._read())
@@ -167,6 +187,12 @@ class ConfigStore:
                     "已添加配置项 container_storage_size=%s",
                     DEFAULT_CONTAINER_STORAGE_SIZE,
                 )
+            users = self._users_mapping(data)
+            for username, value in users.items():
+                if "gpu_ids" not in value:
+                    value["gpu_ids"] = []
+                    changed = True
+                    logger.info("已为用户添加 GPU 配置 username=%s", username)
             if changed:
                 self._write(data)
 
@@ -182,11 +208,26 @@ class ConfigStore:
 
     @staticmethod
     def _record(username: str, value: dict[str, Any]) -> UserRecord:
-        required = {"image", "container_id", "public_key", "active", "created_at"}
+        required = {
+            "image",
+            "container_id",
+            "public_key",
+            "gpu_ids",
+            "active",
+            "created_at",
+        }
         if required - value.keys():
             raise ValueError(f"用户 {username} 的配置不完整")
-        if not all(isinstance(value[field], str) for field in required - {"active"}):
+        if not all(
+            isinstance(value[field], str)
+            for field in required - {"active", "gpu_ids"}
+        ):
             raise ValueError(f"用户 {username} 的字符串字段格式错误")
+        gpu_ids = value["gpu_ids"]
+        if not isinstance(gpu_ids, list) or not all(
+            isinstance(item, str) and item for item in gpu_ids
+        ):
+            raise ValueError(f"用户 {username} 的 gpu_ids 格式错误")
         if not isinstance(value["active"], bool):
             raise TypeError(f"用户 {username} 的 active 必须是布尔值")
         return UserRecord(
@@ -194,6 +235,7 @@ class ConfigStore:
             image=value["image"],
             container_id=value["container_id"],
             public_key=value["public_key"],
+            gpu_ids=tuple(gpu_ids),
             active=value["active"],
             created_at=value["created_at"],
         )
@@ -204,6 +246,7 @@ class ConfigStore:
             "image": record.image,
             "container_id": record.container_id,
             "public_key": record.public_key,
+            "gpu_ids": list(record.gpu_ids),
             "active": record.active,
             "created_at": record.created_at,
         }

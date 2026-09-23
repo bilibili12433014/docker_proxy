@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +52,27 @@ class KeyManager:
         public_data = key.export_public_key("openssh")
         self._write_private(private_path, private_data)
         public_path.write_bytes(public_data)
+        return UserKey(private_path, public_path, normalize_public_key(public_data))
+
+    def reset_user_key(self, username: str) -> UserKey:
+        user_dir = self.root / "users" / username
+        user_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        private_path = user_dir / "id_ed25519"
+        public_path = user_dir / "id_ed25519.pub"
+        suffix = secrets.token_hex(8)
+        temporary_private = user_dir / f".id_ed25519.{suffix}.tmp"
+        temporary_public = user_dir / f".id_ed25519.{suffix}.pub.tmp"
+        key = asyncssh.generate_private_key("ssh-ed25519")
+        private_data = key.export_private_key("openssh")
+        public_data = key.export_public_key("openssh")
+        try:
+            self._write_private(temporary_private, private_data)
+            temporary_public.write_bytes(public_data)
+            os.replace(temporary_private, private_path)
+            os.replace(temporary_public, public_path)
+        finally:
+            temporary_private.unlink(missing_ok=True)
+            temporary_public.unlink(missing_ok=True)
         return UserKey(private_path, public_path, normalize_public_key(public_data))
 
     def private_key_path(self, username: str) -> Path:

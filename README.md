@@ -16,8 +16,11 @@ Docker Proxy 是一个基于 YAML 配置的轻量 Docker 用户管理与 SSH 网
 - 交互登录自动进入持久化的 `workspace` tmux 会话
 - tmux 启用鼠标操作、彩色路径提示符和 100000 行历史记录
 - 缺少 tmux 时自动安装；Ubuntu 和 Debian 普通 APT 仓库使用清华 IPv4 镜像
-- 提供 BAT/CMD 登录命令以及包含私钥和 `login.bat` 的 ZIP 下载
+- 自动识别 NVIDIA 显卡型号、UUID 和数量，创建实例时默认分配全部显卡，也可以逐卡选择
+- 提供无需下载密钥的 PowerShell 临时密钥登录命令
+- 提供 BAT/CMD 登录命令以及包含私钥和 `login.bat` 的 ZIP 下载，不生成 `.ps1` 文件
 - 创建用户遇到同名遗留容器时，网页会要求确认后再重置
+- 用户和受管容器同时存在时，可以保留容器并只重置 SSH 密钥
 
 ## 运行要求
 
@@ -30,6 +33,8 @@ Docker Proxy 是一个基于 YAML 配置的轻量 Docker 用户管理与 SSH 网
 20GB 实例限制通过 Docker 的 `storage-opt size` 实现。使用 `overlay2` 时，Docker 数据目录的底层文件系统必须是启用了 `pquota` 的 XFS；不满足该条件时 Docker 会拒绝创建带容量限制的容器。
 
 用户镜像至少需要包含 `/bin/sh`。若镜像包含 `/bin/bash`，登录后会使用带颜色和当前路径的 Bash 提示符。
+
+GPU 功能要求宿主机已经安装 NVIDIA 驱动和 NVIDIA Container Toolkit，并在执行 `nvidia-ctk runtime configure --runtime=docker` 后重启 Docker。管理页会显示 Docker 存储驱动、底层文件系统、默认 runtime、NVIDIA runtime 注册状态以及识别到的显卡数量；显卡枚举会优先调用本机 `nvidia-smi`，不可用时通过临时 Docker 容器检测，失败时直接显示 Docker 或 NVIDIA runtime 返回的原因。
 
 ## Docker 启动
 
@@ -83,17 +88,19 @@ http://服务器地址:2221/
 
 ## 用户与容器
 
-创建用户时填写唯一用户名和 Docker 镜像。服务会依次完成以下操作：
+创建用户时填写唯一用户名和 Docker 镜像，并选择允许实例使用的 GPU。管理页默认勾选检测到的全部显卡，也允许取消全部显卡或只选择其中一部分。服务会依次完成以下操作：
 
 1. 检查本地镜像，不存在时通过 Docker 拉取。
 2. 创建 `/data/<username>`。
 3. 生成用户 Ed25519 密钥。
-4. 创建名为 `docker-proxy-<username>` 的容器并挂载数据目录。
-5. 将用户、镜像、容器 ID、公钥和状态写入 `config.yaml`。
+4. 使用所选 GPU 和 20GB 可写层限制创建名为 `docker-proxy-<username>` 的容器，并挂载数据目录。
+5. 将用户、镜像、容器 ID、公钥、GPU UUID 和状态写入 `config.yaml`。
 
 容器可写层上限为 `20G`，宿主机绑定挂载的 `/data/<username>` 不计入该限制。如果密钥目录或同名受管容器由此前失败的创建操作遗留，管理界面会提示确认重置。停用用户会同时阻止 SSH 登录并停止容器；重新启用后仍需按需启动容器。
 
 容量限制仅能在创建容器时设置。升级前已经存在的容器不会自动重建，也不会自动获得 20GB 限制；需要保留 `/data/<username>` 后重新创建对应实例。
+
+如果用户名及其受管容器都已经存在，再次提交相同用户名时会进入确认页面。选择复用后不会删除或重建容器，只会生成新的 SSH 密钥、重新启用用户并立即使旧私钥失效；镜像、可写层容量和 GPU 分配保持不变。
 
 ## SSH 登录
 
@@ -103,7 +110,7 @@ http://服务器地址:2221/
 ssh -p 2222 -i id_ed25519_<username> <username>@<服务器地址>
 ```
 
-管理页面也可以复制 Cloudflare 登录命令，或下载一键登录包。Windows 登录脚本会在缺少 `cloudflared` 时执行：
+管理页面提供两种 Windows 登录方式：复制 PowerShell 单行命令，或下载只包含私钥和 `login.bat` 的一键登录包。两种方式都会在缺少 `cloudflared` 时执行：
 
 ```bat
 winget install Cloudflare.cloudflared
@@ -115,7 +122,7 @@ winget install Cloudflare.cloudflared
 ssh -i ".\id_ed25519_<username>" -o IdentitiesOnly=yes -o "ProxyCommand=cloudflared access ssh --hostname %h" <username>@<SSH公网域名>
 ```
 
-登录脚本会收紧 Windows 私钥文件权限，避免 OpenSSH 因私钥可被其他用户读取而拒绝加载。
+PowerShell 单行命令内嵌经过 Base64 编码的 Ed25519 私钥，运行时在 `%TEMP%` 中创建随机临时密钥文件、收紧 ACL，SSH 退出后通过 `finally` 删除。命令本身包含完整私钥，不应发送给其他人，也不应保存在共享终端历史中。BAT 登录包仍会收紧下载目录中的私钥权限，避免 OpenSSH 因私钥可被其他用户读取而拒绝加载。
 
 ## Cloudflare Tunnel
 
@@ -143,7 +150,7 @@ ingress:
 - 容器可写层容量 `container_storage_size: 20G`
 - 容器名称前缀和保活命令
 - 最近一次使用的 Docker 镜像
-- 用户、镜像、容器 ID、公钥、启用状态和创建时间
+- 用户、镜像、容器 ID、公钥、GPU UUID、启用状态和创建时间
 
 用户数据目录固定为宿主机 `/data/<username>`，不从 YAML 读取，避免 Windows 路径或项目路径被错误传递给 Linux Docker。用户配置在管理操作和 SSH 认证时重新读取。
 

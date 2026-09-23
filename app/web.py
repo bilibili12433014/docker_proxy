@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hmac
 import io
 import logging
@@ -31,8 +32,29 @@ from .keys import KeyManager
 
 USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
+GPU_ID_RE = re.compile(r"^GPU-[A-Fa-f0-9-]+$")
 F = TypeVar("F", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
+
+
+def powershell_command(
+    username: str, hostname: str, private_key: bytes
+) -> str:
+    encoded_key = base64.b64encode(private_key).decode("ascii")
+    return "".join(
+        [
+            "$key=Join-Path $env:TEMP ('docker-proxy-'+[guid]::NewGuid().ToString('N')+'.key');",
+            "try{",
+            f"[IO.File]::WriteAllBytes($key,[Convert]::FromBase64String('{encoded_key}'));",
+            "$sid=([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value;",
+            "icacls $key /inheritance:r | Out-Null;",
+            "icacls $key /grant:r (\"*$($sid):R\") | Out-Null;",
+            "if(-not(Get-Command cloudflared -ErrorAction SilentlyContinue)){",
+            "winget install --id Cloudflare.cloudflared -e --source winget --accept-source-agreements --accept-package-agreements | Out-Null};",
+            f"ssh -i $key -o IdentitiesOnly=yes -o \"ProxyCommand=cloudflared access ssh --hostname %h\" {username}@{hostname};",
+            "}finally{Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue}",
+        ]
+    )
 
 
 def batch_command(username: str, hostname: str) -> str:
@@ -82,6 +104,23 @@ def create_app(
 
     app.jinja_env.globals["csrf_token"] = csrf_token
 
+    def selected_gpu_ids() -> tuple[str, ...]:
+        values = tuple(dict.fromkeys(request.form.getlist("gpu_ids")))
+        if not values:
+            return ()
+        if "all" in values:
+            if len(values) != 1:
+                raise ValueError("全部 GPU 不能与单独显卡同时选择")
+            devices, _ = docker_service.gpu_inventory()
+            return tuple(device.device_id for device in devices) or ("all",)
+        if not all(GPU_ID_RE.fullmatch(value) for value in values):
+            raise ValueError("GPU 标识格式无效")
+        devices, _ = docker_service.gpu_inventory()
+        available = {device.device_id for device in devices}
+        if available and not set(values).issubset(available):
+            raise ValueError("选择中包含当前不可用的 GPU")
+        return values
+
     def login_required(view: F) -> F:
         @wraps(view)
         def wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -114,6 +153,7 @@ def create_app(
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "same-origin"
+        response.headers["Cache-Control"] = "no-store"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
         )
@@ -168,16 +208,34 @@ def create_app(
     @login_required
     def dashboard() -> Any:
         hostname = store.public_hostname()
+        docker_ok, docker_message = docker_service.ping()
+        gpu_devices, gpu_error = (
+            docker_service.gpu_inventory()
+            if docker_ok
+            else ((), "Docker 离线，无法检测 GPU")
+        )
+        try:
+            host_info = docker_service.host_info() if docker_ok else None
+        except DockerException as exc:
+            logger.warning("读取 Docker 主机信息失败: %s", exc)
+            host_info = None
         users = []
         for user in store.list_users():
+            private_path = key_manager.private_key_path(user.username)
             users.append(
                 {
                     "record": user,
                     "status": docker_service.status(user.container_id),
+                    "powershell": (
+                        powershell_command(
+                            user.username, hostname, private_path.read_bytes()
+                        )
+                        if private_path.is_file()
+                        else ""
+                    ),
                     "batch": batch_command(user.username, hostname),
                 }
             )
-        docker_ok, docker_message = docker_service.ping()
         return render_template(
             "dashboard.html",
             users=users,
@@ -185,6 +243,9 @@ def create_app(
             default_image=store.last_image(),
             docker_ok=docker_ok,
             docker_message=docker_message,
+            gpu_devices=gpu_devices,
+            gpu_error=gpu_error,
+            host_info=host_info,
         )
 
     @app.post("/users")
@@ -192,7 +253,12 @@ def create_app(
     def create_user() -> Any:
         username = request.form.get("username", "").strip()
         image = request.form.get("image", "").strip()
-        logger.info("收到创建用户请求 username=%s image=%s", username, image)
+        logger.info(
+            "收到创建用户请求 username=%s image=%s reuse_existing=%s",
+            username,
+            image,
+            request.form.get("reuse_existing"),
+        )
         if not USERNAME_RE.fullmatch(username):
             logger.warning("创建用户校验失败 username=%s 原因=用户名格式无效", username)
             flash(
@@ -209,9 +275,46 @@ def create_app(
             flash("Docker 镜像名称格式无效", "error")
             return redirect(url_for("dashboard"))
         with create_lock:
-            if store.get_user(username) is not None:
-                logger.warning("创建用户校验失败 username=%s 原因=用户名已存在", username)
-                flash("该用户名已经存在", "error")
+            stored_user = store.get_user(username)
+            if stored_user is not None:
+                existing = docker_service.existing_instance(username)
+                if (
+                    existing is None
+                    or not existing.managed
+                    or existing.container_id != stored_user.container_id
+                ):
+                    logger.error(
+                        "无法复用用户实例 username=%s configured_container=%s existing=%s",
+                        username,
+                        stored_user.container_id,
+                        existing,
+                    )
+                    flash("用户配置存在，但对应的受管容器不匹配，无法安全复用", "error")
+                    return redirect(url_for("dashboard"))
+                if request.form.get("reuse_existing") != "yes":
+                    return render_template(
+                        "confirm_reuse.html",
+                        user=stored_user,
+                        instance=existing,
+                    )
+                try:
+                    user_key = key_manager.reset_user_key(username)
+                    store.reset_public_key(username, user_key.public_key)
+                except (OSError, TypeError, ValueError) as exc:
+                    logger.exception("复用实例并重置密钥失败 username=%s", username)
+                    flash(f"复用实例失败: {exc}", "error")
+                    return redirect(url_for("dashboard"))
+                logger.warning(
+                    "已复用容器并重置 SSH 密钥 username=%s container_id=%s",
+                    username,
+                    existing.container_id,
+                )
+                flash(f"已复用 {username} 的容器并重置 SSH 密钥，旧密钥立即失效", "success")
+                return redirect(url_for("dashboard"))
+            try:
+                gpu_ids = selected_gpu_ids()
+            except ValueError as exc:
+                flash(str(exc), "error")
                 return redirect(url_for("dashboard"))
             user_key = None
             container_id = None
@@ -244,6 +347,7 @@ def create_app(
                             username=username,
                             image=image,
                             instance=existing,
+                            gpu_ids=gpu_ids,
                         )
                     phase = "删除旧容器"
                     logger.warning(
@@ -264,10 +368,18 @@ def create_app(
                 user_key = key_manager.create_user_key(username)
                 phase = "创建 Docker 容器"
                 logger.debug("创建用户阶段 username=%s phase=%s", username, phase)
-                container_id = docker_service.create_instance(username, image)
+                container_id = docker_service.create_instance(
+                    username, image, gpu_ids
+                )
                 phase = "保存用户配置"
                 logger.debug("创建用户阶段 username=%s phase=%s", username, phase)
-                store.add_user(username, image, container_id, user_key.public_key)
+                store.add_user(
+                    username,
+                    image,
+                    container_id,
+                    user_key.public_key,
+                    gpu_ids,
+                )
             except (DockerException, OSError, TypeError, ValueError) as exc:
                 logger.exception(
                     "创建用户失败 username=%s image=%s phase=%s",
@@ -292,10 +404,11 @@ def create_app(
                 flash(f"创建用户失败: {exc}", "error")
                 return redirect(url_for("dashboard"))
         logger.info(
-            "创建用户完成 username=%s image=%s container_id=%s",
+            "创建用户完成 username=%s image=%s container_id=%s gpu_ids=%s",
             username,
             image,
             container_id,
+            gpu_ids,
         )
         flash(f"用户 {username} 已创建，容器处于停止状态", "success")
         return redirect(url_for("dashboard"))
