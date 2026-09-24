@@ -549,7 +549,7 @@ class SSHGateway:
             command = INTERACTIVE_SHELL
         environment = process_environment(process)
         agent_bridge = None
-        agent_path = process.get_agent_path()
+        agent_path = process.channel.get_agent_path()
         if agent_path:
             try:
                 agent_bridge = await self.open_agent_bridge(username, agent_path)
