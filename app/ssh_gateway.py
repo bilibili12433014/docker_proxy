@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import posixpath
+import re
+import secrets
+import shlex
 import socket
+from functools import partial
+from pathlib import Path
 from typing import Any
 
 import asyncssh
@@ -104,28 +111,104 @@ INTERACTIVE_SHELL = [
     "-c",
     APT_MIRROR_SETUP + TMUX_INSTALL + SHELL_SETUP + TMUX_START,
 ]
-SCP_INSTALL = (
-    "if ! command -v scp >/dev/null 2>&1; then "
-    + APT_MIRROR_SETUP
-    + "log=/tmp/docker_proxy_scp_install.log; "
-    "if command -v apt-get >/dev/null 2>&1; then "
-    "apt-get -o Acquire::ForceIPv4=true update >\"$log\" 2>&1 && "
-    "DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true install -y openssh-client >>\"$log\" 2>&1; "
-    "elif command -v apk >/dev/null 2>&1; then apk add --no-cache openssh-client >\"$log\" 2>&1; "
-    "elif command -v dnf >/dev/null 2>&1; then dnf install -y openssh-clients >\"$log\" 2>&1; "
-    "elif command -v yum >/dev/null 2>&1; then yum install -y openssh-clients >\"$log\" 2>&1; "
-    "elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm openssh >\"$log\" 2>&1; "
-    "fi; "
-    "if ! command -v scp >/dev/null 2>&1; then printf '\001容器内无法安装 scp，请查看 %s。\n' \"$log\"; exit 127; fi; "
-    "fi; "
+
+
+def tool_install(
+    command: str,
+    apt_package: str,
+    apk_package: str,
+    rpm_package: str,
+    pacman_package: str,
+) -> str:
+    log_path = f"/tmp/docker_proxy_{command}_install.log"
+    return (
+        f"if ! command -v {command} >/dev/null 2>&1; then "
+        + APT_MIRROR_SETUP
+        + f"log={shlex.quote(log_path)}; "
+        "if command -v apt-get >/dev/null 2>&1; then "
+        "apt-get -o Acquire::ForceIPv4=true update >\"$log\" 2>&1 && "
+        f"DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true install -y {apt_package} >>\"$log\" 2>&1; "
+        f"elif command -v apk >/dev/null 2>&1; then apk add --no-cache {apk_package} >\"$log\" 2>&1; "
+        f"elif command -v dnf >/dev/null 2>&1; then dnf install -y {rpm_package} >\"$log\" 2>&1; "
+        f"elif command -v yum >/dev/null 2>&1; then yum install -y {rpm_package} >\"$log\" 2>&1; "
+        f"elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm {pacman_package} >\"$log\" 2>&1; "
+        "fi; "
+        f"if ! command -v {command} >/dev/null 2>&1; then "
+        f"printf '无法安装 {command}，安装日志如下：\\n' >&2; "
+        "tail -n 30 \"$log\" >&2 2>/dev/null || true; exit 127; fi; "
+        "fi; "
+    )
+
+
+RSYNC_INSTALL = tool_install("rsync", "rsync", "rsync", "rsync", "rsync")
+GIT_INSTALL = tool_install("git-upload-pack", "git", "git", "git", "git")
+NC_INSTALL = tool_install(
+    "nc",
+    "netcat-openbsd",
+    "netcat-openbsd",
+    "nmap-ncat",
+    "openbsd-netcat",
 )
+ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def command_setup(command: str) -> str:
+    stripped = command.lstrip()
+    if stripped.startswith("rsync "):
+        return RSYNC_INSTALL
+    if stripped.startswith(
+        ("git-upload-pack ", "git-receive-pack ", "git-upload-archive ")
+    ):
+        return GIT_INSTALL
+    return ""
+
+
+def session_environment(environment: Any) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for key, value in dict(environment or {}).items():
+        key = str(key)
+        value = str(value)
+        if (
+            ENVIRONMENT_NAME_RE.fullmatch(key)
+            and len(key) <= 128
+            and len(value) <= 8192
+            and "\x00" not in value
+        ):
+            result[key] = value
+    return result
+
+
+def process_environment(process: asyncssh.SSHServerProcess[bytes]) -> dict[str, str]:
+    result = session_environment(process.env)
+    peer = process.get_extra_info("peername")
+    local = process.get_extra_info("sockname")
+    if (
+        isinstance(peer, tuple)
+        and len(peer) >= 2
+        and isinstance(local, tuple)
+        and len(local) >= 2
+    ):
+        peer_host, peer_port = str(peer[0]), str(peer[1])
+        local_host, local_port = str(local[0]), str(local[1])
+        result.setdefault(
+            "SSH_CONNECTION",
+            f"{peer_host} {peer_port} {local_host} {local_port}",
+        )
+        result.setdefault("SSH_CLIENT", f"{peer_host} {peer_port} {local_port}")
+    result.setdefault("USER", "root")
+    result.setdefault("LOGNAME", "root")
+    result.setdefault("HOME", "/root")
+    return result
 
 
 class GatewaySSHServer(asyncssh.SSHServer):
-    def __init__(self, store: ConfigStore):
+    def __init__(self, store: ConfigStore, forward_handler: Any):
         self.store = store
+        self.forward_handler = forward_handler
+        self.username = ""
 
     def begin_auth(self, username: str) -> bool:
+        self.username = username
         return True
 
     def public_key_auth_supported(self) -> bool:
@@ -137,6 +220,75 @@ class GatewaySSHServer(asyncssh.SSHServer):
             return False
         offered = normalize_public_key(key.export_public_key("openssh"))
         return bool(offered) and offered == normalize_public_key(user.public_key)
+
+    def connection_requested(
+        self,
+        dest_host: str,
+        dest_port: int,
+        orig_host: str,
+        orig_port: int,
+    ) -> Any:
+        if self.store.get_active_user(self.username) is None:
+            raise asyncssh.ChannelOpenError(
+                asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED,
+                "用户不存在或已停用",
+            )
+        return partial(
+            self.forward_handler,
+            self.username,
+            dest_host,
+            dest_port,
+            orig_host,
+            orig_port,
+        )
+
+    @staticmethod
+    def server_requested(listen_host: str, listen_port: int) -> bool:
+        return listen_host in {"localhost", "127.0.0.1", "::1"}
+
+
+class GatewaySFTPServer(asyncssh.SFTPServer):
+    def __init__(
+        self,
+        channel: asyncssh.SSHServerChannel,
+        store: ConfigStore,
+        data_root: Path,
+    ):
+        username = str(channel.get_extra_info("username") or "")
+        if store.get_active_user(username) is None:
+            raise asyncssh.SFTPPermissionDenied("用户不存在或已停用")
+        root = data_root.resolve()
+        user_root = (root / username).resolve()
+        if user_root.parent != root:
+            raise asyncssh.SFTPPermissionDenied("数据目录无效")
+        user_root.mkdir(parents=True, exist_ok=True)
+        self._user_root = os.fsencode(user_root)
+        super().__init__(channel)
+
+    def map_path(self, path: bytes) -> bytes:
+        virtual_path = posixpath.normpath(posixpath.join(b"/", path))
+        if virtual_path == b"/data":
+            virtual_path = b"/"
+        elif virtual_path.startswith(b"/data/"):
+            virtual_path = virtual_path[len(b"/data") :]
+        local_path = os.path.realpath(
+            os.path.join(self._user_root, virtual_path.lstrip(b"/"))
+        )
+        if local_path != self._user_root and not local_path.startswith(
+            self._user_root + os.sep.encode()
+        ):
+            raise asyncssh.SFTPPermissionDenied("路径超出用户数据目录")
+        return local_path
+
+    def reverse_map_path(self, path: bytes) -> bytes:
+        local_path = os.path.realpath(path)
+        if local_path == self._user_root:
+            return b"/data"
+        prefix = self._user_root + os.sep.encode()
+        if not local_path.startswith(prefix):
+            raise asyncssh.SFTPNoSuchFile("文件不存在")
+        relative = local_path[len(self._user_root) :].replace(os.sep.encode(), b"/")
+        return b"/data" + relative
 
 
 class SSHGateway:
@@ -154,11 +306,20 @@ class SSHGateway:
     async def start(self, host: str, port: int) -> Any:
         host_key = self.key_manager.ensure_host_key()
         self._acceptor = await asyncssh.create_server(
-            lambda: GatewaySSHServer(self.store),
+            lambda: GatewaySSHServer(self.store, self.forward_connection),
             host,
             port,
             server_host_keys=[str(host_key)],
             process_factory=self.handle_process,
+            sftp_factory=lambda channel: GatewaySFTPServer(
+                channel,
+                self.store,
+                self.docker.settings.data_root,
+            ),
+            server_version="OpenSSH_9.9p2",
+            keepalive_interval=30,
+            keepalive_count_max=3,
+            agent_forwarding=True,
             encoding=None,
             line_editor=False,
         )
@@ -168,6 +329,194 @@ class SSHGateway:
         if self._acceptor is not None:
             self._acceptor.close()
             await self._acceptor.wait_closed()
+
+    async def forward_connection(
+        self,
+        username: str,
+        dest_host: str,
+        dest_port: int,
+        orig_host: str,
+        orig_port: int,
+        reader: Any,
+        writer: Any,
+    ) -> None:
+        user = self.store.get_active_user(username)
+        if (
+            user is None
+            or not 1 <= dest_port <= 65535
+            or not re.fullmatch(r"[A-Za-z0-9._:%-]{1,253}", dest_host)
+            or dest_host.startswith("-")
+        ):
+            writer.close()
+            return
+        status = await asyncio.to_thread(self.docker.status, user.container_id)
+        if status != "running":
+            writer.close()
+            return
+        command = [
+            "/bin/sh",
+            "-lc",
+            NC_INSTALL + f"exec nc {shlex.quote(dest_host)} {dest_port}",
+        ]
+        try:
+            connection = await asyncio.to_thread(
+                self.docker.open_exec,
+                user.container_id,
+                command,
+                None,
+                None,
+                None,
+            )
+        except (DockerException, OSError, ValueError):
+            logger.exception(
+                "TCP 转发建立失败 username=%s destination=%s:%d",
+                username,
+                dest_host,
+                dest_port,
+            )
+            writer.close()
+            return
+        logger.info(
+            "TCP 转发已连接 username=%s origin=%s:%d destination=%s:%d exec_id=%s",
+            username,
+            orig_host,
+            orig_port,
+            dest_host,
+            dest_port,
+            connection.exec_id,
+        )
+        input_task = asyncio.create_task(
+            self._copy_forward_to_docker(reader, connection)
+        )
+        try:
+            while True:
+                stream, data = await asyncio.to_thread(
+                    self._read_socket,
+                    connection,
+                    32768,
+                )
+                if not data:
+                    break
+                if stream == 1:
+                    writer.write(data)
+                    await writer.drain()
+                else:
+                    logger.debug(
+                        "TCP 转发容器错误输出 username=%s exec_id=%s message=%s",
+                        username,
+                        connection.exec_id,
+                        data.decode("utf-8", "replace").strip(),
+                    )
+        finally:
+            input_task.cancel()
+            await asyncio.gather(input_task, return_exceptions=True)
+            try:
+                connection.socket.close()
+            except OSError:
+                pass
+            writer.close()
+
+    @staticmethod
+    async def _copy_forward_to_docker(
+        reader: Any,
+        connection: ExecConnection,
+    ) -> None:
+        try:
+            while True:
+                data = await reader.read(32768)
+                if not data:
+                    return
+                await asyncio.to_thread(SSHGateway._write_all, connection.socket, data)
+        finally:
+            await asyncio.to_thread(SSHGateway._shutdown_write, connection.socket)
+
+    async def open_agent_bridge(
+        self,
+        username: str,
+        agent_path: str,
+    ) -> tuple[Any, Path, str]:
+        data_root = self.docker.settings.data_root.resolve()
+        user_root = (data_root / username).resolve()
+        if user_root.parent != data_root:
+            raise OSError("用户数据目录无效")
+        user_root.mkdir(parents=True, exist_ok=True)
+        socket_name = f".docker_proxy_agent_{secrets.token_hex(8)}.sock"
+        host_path = user_root / socket_name
+        server = await asyncio.start_unix_server(
+            partial(self.relay_agent, agent_path),
+            path=str(host_path),
+        )
+        try:
+            os.chmod(host_path, 0o600)
+        except OSError:
+            server.close()
+            await server.wait_closed()
+            host_path.unlink(missing_ok=True)
+            raise
+        logger.info("SSH Agent 转发已启用 username=%s", username)
+        return server, host_path, f"/data/{socket_name}"
+
+    @staticmethod
+    async def relay_agent(
+        agent_path: str,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            agent_reader, agent_writer = await asyncio.open_unix_connection(agent_path)
+        except OSError:
+            logger.exception("连接 SSH Agent 转发 socket 失败")
+            writer.close()
+            await writer.wait_closed()
+            return
+        first = asyncio.create_task(
+            SSHGateway.copy_stream(reader, agent_writer)
+        )
+        second = asyncio.create_task(
+            SSHGateway.copy_stream(agent_reader, writer)
+        )
+        try:
+            await asyncio.gather(first, second)
+        except (ConnectionError, OSError):
+            logger.debug("SSH Agent 转发连接已关闭", exc_info=True)
+        finally:
+            first.cancel()
+            second.cancel()
+            await asyncio.gather(first, second, return_exceptions=True)
+            agent_writer.close()
+            writer.close()
+            await asyncio.gather(
+                agent_writer.wait_closed(),
+                writer.wait_closed(),
+                return_exceptions=True,
+            )
+
+    @staticmethod
+    async def copy_stream(reader: Any, writer: Any) -> None:
+        while True:
+            data = await reader.read(32768)
+            if not data:
+                try:
+                    writer.write_eof()
+                except (AttributeError, OSError):
+                    pass
+                return
+            writer.write(data)
+            await writer.drain()
+
+    @staticmethod
+    async def close_agent_bridge(
+        bridge: tuple[Any, Path, str] | None,
+    ) -> None:
+        if bridge is None:
+            return
+        server, host_path, _ = bridge
+        server.close()
+        await server.wait_closed()
+        try:
+            host_path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("清理 SSH Agent 转发 socket 失败 path=%s", host_path)
 
     async def handle_process(self, process: asyncssh.SSHServerProcess[bytes]) -> None:
         username = process.get_extra_info("username")
@@ -179,18 +528,36 @@ class SSHGateway:
         if status != "running":
             await self._fail(process, f"容器当前状态为 {status}，请先在管理界面启动")
             return
+        if process.subsystem:
+            await self._fail(process, f"不支持 SSH 子系统: {process.subsystem}")
+            return
         requested = process.command
         if isinstance(requested, bytes):
             requested = requested.decode("utf-8", "replace")
+        pid_file = ""
         if requested:
+            pid_file = f"/tmp/.docker_proxy_exec_{secrets.token_hex(12)}.pid"
+            setup = command_setup(requested)
             command_text = (
-                SCP_INSTALL + "exec " + requested
-                if requested.lstrip().startswith("scp ")
-                else requested
+                f"printf '%s' $$ > {shlex.quote(pid_file)}; "
+                + setup
+                + ("exec " if setup else "")
+                + requested
             )
             command = ["/bin/sh", "-lc", command_text]
         else:
             command = INTERACTIVE_SHELL
+        environment = process_environment(process)
+        agent_bridge = None
+        agent_path = process.get_agent_path()
+        if agent_path:
+            try:
+                agent_bridge = await self.open_agent_bridge(username, agent_path)
+            except OSError as exc:
+                logger.exception("创建 SSH Agent 转发失败 username=%s", username)
+                await self._fail(process, f"无法建立 SSH Agent 转发: {exc}")
+                return
+            environment["SSH_AUTH_SOCK"] = agent_bridge[2]
         try:
             connection = await asyncio.to_thread(
                 self.docker.open_exec,
@@ -198,9 +565,11 @@ class SSHGateway:
                 command,
                 process.term_type,
                 process.term_size,
+                environment,
             )
         except (DockerException, OSError, ValueError) as exc:
             logger.exception("无法为用户 %s 创建 Docker exec", username)
+            await self.close_agent_bridge(agent_bridge)
             await self._fail(process, f"无法进入容器: {exc}")
             return
         logger.info(
@@ -210,10 +579,20 @@ class SSHGateway:
             connection.exec_id,
             command,
         )
-        input_task = asyncio.create_task(self._copy_ssh_to_docker(process, connection))
+        input_task = asyncio.create_task(
+            self._copy_ssh_to_docker(
+                process,
+                connection,
+                user.container_id,
+                pid_file,
+            )
+        )
         output_task = asyncio.create_task(self._copy_docker_to_ssh(process, connection))
+        output_failed = False
         try:
             await output_task
+        except Exception:
+            output_failed = True
         finally:
             input_task.cancel()
             try:
@@ -230,8 +609,29 @@ class SSHGateway:
                     connection.exec_id,
                     input_result[0],
                 )
+            await self.close_agent_bridge(agent_bridge)
+        if pid_file:
+            try:
+                await asyncio.to_thread(
+                    self.docker.remove_exec_pid_file,
+                    user.container_id,
+                    pid_file,
+                )
+            except DockerException:
+                logger.exception(
+                    "清理远程命令 PID 文件失败 username=%s path=%s",
+                    username,
+                    pid_file,
+                )
         try:
-            exit_code = await asyncio.to_thread(self.docker.exec_exit_code, connection)
+            exit_code = (
+                1
+                if output_failed
+                else await asyncio.to_thread(
+                    self.docker.exec_exit_code,
+                    connection,
+                )
+            )
         except DockerException:
             exit_code = 1
             logger.exception(
@@ -251,6 +651,8 @@ class SSHGateway:
         self,
         process: asyncssh.SSHServerProcess[bytes],
         connection: ExecConnection,
+        container_id: str,
+        pid_file: str,
     ) -> None:
         username = process.get_extra_info("username")
         try:
@@ -273,6 +675,53 @@ class SSHGateway:
                         exc.width,
                         exc.height,
                     )
+                    continue
+                except asyncssh.BreakReceived:
+                    logger.info(
+                        "收到 SSH Break username=%s exec_id=%s",
+                        username,
+                        connection.exec_id,
+                    )
+                    if connection.tty or not pid_file:
+                        await asyncio.to_thread(
+                            self._write_all,
+                            connection.socket,
+                            b"\x03",
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            self.docker.signal_exec,
+                            container_id,
+                            pid_file,
+                            "INT",
+                        )
+                    continue
+                except asyncssh.SignalReceived as exc:
+                    signal_name = exc.signal.upper()
+                    logger.info(
+                        "收到 SSH 信号 username=%s exec_id=%s signal=%s",
+                        username,
+                        connection.exec_id,
+                        signal_name,
+                    )
+                    control = {
+                        "INT": b"\x03",
+                        "QUIT": b"\x1c",
+                        "TSTP": b"\x1a",
+                    }.get(signal_name)
+                    if connection.tty and control:
+                        await asyncio.to_thread(
+                            self._write_all,
+                            connection.socket,
+                            control,
+                        )
+                    elif pid_file:
+                        await asyncio.to_thread(
+                            self.docker.signal_exec,
+                            container_id,
+                            pid_file,
+                            signal_name,
+                        )
                     continue
                 if not data:
                     logger.info(

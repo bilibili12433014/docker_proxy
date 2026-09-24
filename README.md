@@ -20,6 +20,11 @@ Docker Proxy 是一个基于 YAML 配置的轻量 Docker 用户管理与 SSH 网
 - 已创建的实例可在管理页面修改 GPU 分配，重建时保留 SSH 密钥、运行状态和 `/data`
 - 提供无需下载密钥的 PowerShell 临时密钥登录命令
 - 提供无需下载密钥的 PowerShell SCP 命令，将 `FILE_NAME` 上传到实例的 `/data/`
+- 原生支持 SFTP、SCP 上传下载、SSHFS、rsync 和 Git over SSH
+- 支持远程命令、管道输入、独立标准输出与错误流、退出码、环境变量、终端缩放和 SSH 信号
+- 支持 `-L` 本地转发、`-D` 动态 SOCKS 转发，以及仅监听服务端回环地址的 `-R` 远程转发
+- 支持 `ssh -A` Agent 转发，容器内可直接通过临时 `SSH_AUTH_SOCK` 使用客户端密钥
+- SSH 会话启用协议级保活，并提供常规 OpenSSH 服务端标识及 `SSH_CLIENT`、`SSH_CONNECTION` 环境
 - 创建用户遇到同名遗留容器时，网页会要求确认后再重置
 - 只要同名受管容器存在，无论 YAML 中是否已有该用户，都可以保留容器并只重置 SSH 密钥
 
@@ -115,7 +120,11 @@ ssh -p 2222 -i id_ed25519_<username> <username>@<服务器地址>
 
 管理页面提供内嵌 Ed25519 私钥的 PowerShell 登录命令和 SCP 上传命令，不再提供一键登录包。两条命令都会自动安装缺失的 `cloudflared`，在 `%TEMP%` 中创建随机临时密钥、收紧 ACL，并在命令结束后删除密钥。
 
-SCP 命令以 `$file="FILE_NAME";` 开头，只需修改最前面的 `FILE_NAME` 即可指定待上传文件，目标固定为实例内的 `/data/`。命令使用 `scp -O` 兼容 SSH 网关的命令转发方式；如果镜像中没有 `scp`，网关会在第一次传输前通过镜像的包管理器静默安装。命令本身包含完整私钥，不应发送给其他人，也不应保存在共享终端历史中。
+SCP 命令以 `$file="FILE_NAME";` 开头，只需修改最前面的 `FILE_NAME` 即可指定待上传文件，目标固定为实例内的 `/data/`。命令不使用 `-O`，由新版 OpenSSH 的 `scp` 通过网关原生 SFTP 上传；内容直接写入宿主机 `/data/<username>`，不要求容器内安装 `scp`，容器停止时也可以上传。命令本身包含完整私钥，不应发送给其他人，也不应保存在共享终端历史中。
+
+SFTP、SCP 和 SSHFS 看到的 `/data` 与容器内 `/data` 对应同一个宿主机目录。`rsync`、Git over SSH 和 TCP 转发所需的工具若不在镜像中，会通过镜像的包管理器静默安装；`-L` 与 `-D` 的目标连接从用户容器内部发起，因此 `localhost` 指向该用户的容器。`-R` 只允许监听 SSH 网关主机的回环地址，避免把转发端口意外暴露到公网。
+
+客户端使用 `ssh -A` 时，网关会在该用户独占的 `/data` 中创建仅当前会话可用的隐藏 socket，并把它作为容器内的 `SSH_AUTH_SOCK`；SSH 会话结束后 socket 会立即删除。Agent 转发会让远端程序在连接存续期间使用客户端 agent，应只对可信实例启用。
 
 ## Cloudflare Tunnel
 

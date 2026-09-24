@@ -438,9 +438,13 @@ class DockerService:
         command: list[str],
         term_type: str | None,
         term_size: tuple[int, int, int, int] | None,
+        environment: dict[str, str] | None = None,
     ) -> ExecConnection:
         api = self.client().api
         tty = term_type is not None
+        exec_environment = {"TERM": term_type or "xterm-256color"}
+        if environment:
+            exec_environment.update(environment)
         result = api.exec_create(
             container=container_id,
             cmd=command,
@@ -449,7 +453,7 @@ class DockerService:
             stderr=True,
             tty=tty,
             user="root",
-            environment={"TERM": term_type or "xterm-256color"},
+            environment=exec_environment,
         )
         exec_id = result["Id"]
         sock = api.exec_start(exec_id, tty=tty, socket=True)
@@ -458,6 +462,42 @@ class DockerService:
             if width and height:
                 api.exec_resize(exec_id, height=height, width=width)
         return ExecConnection(exec_id, sock, api, tty)
+
+    def signal_exec(
+        self,
+        container_id: str,
+        pid_file: str,
+        signal_name: str,
+    ) -> None:
+        allowed = {
+            "ABRT",
+            "ALRM",
+            "FPE",
+            "HUP",
+            "ILL",
+            "INT",
+            "KILL",
+            "PIPE",
+            "QUIT",
+            "SEGV",
+            "TERM",
+            "TSTP",
+            "USR1",
+            "USR2",
+        }
+        if signal_name not in allowed:
+            raise ValueError(f"不支持的信号: {signal_name}")
+        script = 'pid=$(cat "$1" 2>/dev/null) || exit 0; kill -"$2" "$pid"'
+        self.client().containers.get(container_id).exec_run(
+            ["/bin/sh", "-c", script, "docker-proxy-signal", pid_file, signal_name],
+            user="root",
+        )
+
+    def remove_exec_pid_file(self, container_id: str, pid_file: str) -> None:
+        self.client().containers.get(container_id).exec_run(
+            ["/bin/sh", "-c", 'rm -f "$1"', "docker-proxy-cleanup", pid_file],
+            user="root",
+        )
 
     def exec_exit_code(self, connection: ExecConnection) -> int:
         result = connection.api.exec_inspect(connection.exec_id)
