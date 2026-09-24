@@ -61,9 +61,9 @@ def powershell_command(username: str, hostname: str, private_key: bytes) -> str:
 
 
 def powershell_scp_command(username: str, hostname: str, private_key: bytes) -> str:
-    return powershell_key_command(
+    return '$file="FILE_NAME";' + powershell_key_command(
         private_key,
-        f"scp -O -i $key -o IdentitiesOnly=yes -o \"ProxyCommand=cloudflared access ssh --hostname %h\" \"FILE_NAME\" \"{username}@{hostname}:/data/\";",
+        f"scp -O -i $key -o IdentitiesOnly=yes -o \"ProxyCommand=cloudflared access ssh --hostname %h\" \"$file\" \"{username}@{hostname}:/data/\";",
     )
 
 
