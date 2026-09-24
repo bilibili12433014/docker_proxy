@@ -104,6 +104,21 @@ INTERACTIVE_SHELL = [
     "-c",
     APT_MIRROR_SETUP + TMUX_INSTALL + SHELL_SETUP + TMUX_START,
 ]
+SCP_INSTALL = (
+    "if ! command -v scp >/dev/null 2>&1; then "
+    + APT_MIRROR_SETUP
+    + "log=/tmp/docker_proxy_scp_install.log; "
+    "if command -v apt-get >/dev/null 2>&1; then "
+    "apt-get -o Acquire::ForceIPv4=true update >\"$log\" 2>&1 && "
+    "DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true install -y openssh-client >>\"$log\" 2>&1; "
+    "elif command -v apk >/dev/null 2>&1; then apk add --no-cache openssh-client >\"$log\" 2>&1; "
+    "elif command -v dnf >/dev/null 2>&1; then dnf install -y openssh-clients >\"$log\" 2>&1; "
+    "elif command -v yum >/dev/null 2>&1; then yum install -y openssh-clients >\"$log\" 2>&1; "
+    "elif command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm openssh >\"$log\" 2>&1; "
+    "fi; "
+    "if ! command -v scp >/dev/null 2>&1; then printf '\001容器内无法安装 scp，请查看 %s。\n' \"$log\"; exit 127; fi; "
+    "fi; "
+)
 
 
 class GatewaySSHServer(asyncssh.SSHServer):
@@ -167,7 +182,15 @@ class SSHGateway:
         requested = process.command
         if isinstance(requested, bytes):
             requested = requested.decode("utf-8", "replace")
-        command = ["/bin/sh", "-lc", requested] if requested else INTERACTIVE_SHELL
+        if requested:
+            command_text = (
+                SCP_INSTALL + "exec " + requested
+                if requested.lstrip().startswith("scp ")
+                else requested
+            )
+            command = ["/bin/sh", "-lc", command_text]
+        else:
+            command = INTERACTIVE_SHELL
         try:
             connection = await asyncio.to_thread(
                 self.docker.open_exec,
@@ -284,8 +307,8 @@ class SSHGateway:
         username = process.get_extra_info("username")
         try:
             while True:
-                data = await asyncio.to_thread(
-                    SSHGateway._read_socket, connection.socket, 32768
+                stream, data = await asyncio.to_thread(
+                    SSHGateway._read_socket, connection, 32768
                 )
                 if not data:
                     logger.info(
@@ -300,8 +323,9 @@ class SSHGateway:
                     connection.exec_id,
                     len(data),
                 )
-                process.stdout.write(data)
-                await process.stdout.drain()
+                output = process.stderr if stream == 2 else process.stdout
+                output.write(data)
+                await output.drain()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -329,9 +353,35 @@ class SSHGateway:
             view = view[written:]
 
     @staticmethod
-    def _read_socket(sock: Any, size: int) -> bytes:
+    def _read_socket(connection: ExecConnection, size: int) -> tuple[int, bytes]:
+        sock = connection.socket
         raw_socket = getattr(sock, "_sock", sock)
-        recv = getattr(raw_socket, "recv", None)
+        if connection.tty:
+            return 1, SSHGateway._read_from_socket(raw_socket, size)
+        while True:
+            header = SSHGateway._read_exact(raw_socket, 8)
+            if not header:
+                return 1, b""
+            stream = header[0]
+            length = int.from_bytes(header[4:8], "big")
+            if length:
+                return stream, SSHGateway._read_exact(raw_socket, length)
+
+    @staticmethod
+    def _read_exact(sock: Any, size: int) -> bytes:
+        chunks = bytearray()
+        while len(chunks) < size:
+            chunk = SSHGateway._read_from_socket(sock, size - len(chunks))
+            if not chunk:
+                if chunks:
+                    raise OSError("Docker exec 输出流意外结束")
+                return b""
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    @staticmethod
+    def _read_from_socket(sock: Any, size: int) -> bytes:
+        recv = getattr(sock, "recv", None)
         if recv is not None:
             return recv(size)
         return sock.read(size)

@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import base64
 import hmac
-import io
 import logging
 import re
 import secrets
 import threading
-import zipfile
 from collections.abc import Callable
 from functools import wraps
 from typing import Any, TypeVar, cast
@@ -32,14 +30,12 @@ from .keys import KeyManager
 
 USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
-GPU_ID_RE = re.compile(r"^GPU-[A-Fa-f0-9-]+$")
+GPU_ID_RE = re.compile(r"^(?:0|[1-9][0-9]*|GPU-[A-Fa-f0-9-]+)$")
 F = TypeVar("F", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
 
 
-def powershell_command(
-    username: str, hostname: str, private_key: bytes
-) -> str:
+def powershell_key_command(private_key: bytes, operation: str) -> str:
     encoded_key = base64.b64encode(private_key).decode("ascii")
     return "".join(
         [
@@ -51,23 +47,23 @@ def powershell_command(
             "icacls $key /grant:r (\"*$($sid):R\") | Out-Null;",
             "if(-not(Get-Command cloudflared -ErrorAction SilentlyContinue)){",
             "winget install --id Cloudflare.cloudflared -e --source winget --accept-source-agreements --accept-package-agreements | Out-Null};",
-            f"ssh -i $key -o IdentitiesOnly=yes -o \"ProxyCommand=cloudflared access ssh --hostname %h\" {username}@{hostname};",
+            operation,
             "}finally{Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue}",
         ]
     )
 
 
-def batch_script(username: str, hostname: str) -> str:
-    return "\r\n".join(
-        [
-            "@echo off",
-            "where cloudflared >nul 2>nul || winget install --id Cloudflare.cloudflared -e --source winget --accept-source-agreements --accept-package-agreements",
-            'set "KEY=%~dp0id_ed25519"',
-            'icacls "%KEY%" /inheritance:r >nul || exit /b 1',
-            'icacls "%KEY%" /grant:r "%USERDOMAIN%\\%USERNAME%:R" >nul || exit /b 1',
-            f'ssh -i "%KEY%" -o IdentitiesOnly=yes -o "ProxyCommand=cloudflared access ssh --hostname %%h" {username}@{hostname}',
-            "",
-        ]
+def powershell_command(username: str, hostname: str, private_key: bytes) -> str:
+    return powershell_key_command(
+        private_key,
+        f"ssh -i $key -o IdentitiesOnly=yes -o \"ProxyCommand=cloudflared access ssh --hostname %h\" {username}@{hostname};",
+    )
+
+
+def powershell_scp_command(username: str, hostname: str, private_key: bytes) -> str:
+    return powershell_key_command(
+        private_key,
+        f"scp -O -i $key -o IdentitiesOnly=yes -o \"ProxyCommand=cloudflared access ssh --hostname %h\" \"FILE_NAME\" \"{username}@{hostname}:/data/\";",
     )
 
 
@@ -96,6 +92,13 @@ def create_app(
 
     app.jinja_env.globals["csrf_token"] = csrf_token
 
+    def indexed_gpu_ids(values: tuple[str, ...]) -> tuple[str, ...]:
+        if not values or "all" in values:
+            return values
+        devices, _ = docker_service.gpu_inventory()
+        indexes = {device.device_id: str(device.index) for device in devices}
+        return tuple(dict.fromkeys(indexes.get(value, value) for value in values))
+
     def selected_gpu_ids() -> tuple[str, ...]:
         values = tuple(dict.fromkeys(request.form.getlist("gpu_ids")))
         if not values:
@@ -104,14 +107,19 @@ def create_app(
             if len(values) != 1:
                 raise ValueError("全部 GPU 不能与单独显卡同时选择")
             devices, _ = docker_service.gpu_inventory()
-            return tuple(device.device_id for device in devices) or ("all",)
+            return tuple(str(device.index) for device in devices) or ("all",)
         if not all(GPU_ID_RE.fullmatch(value) for value in values):
-            raise ValueError("GPU 标识格式无效")
+            raise ValueError("GPU 编号格式无效")
         devices, _ = docker_service.gpu_inventory()
-        available = {device.device_id for device in devices}
+        available = {
+            value
+            for device in devices
+            for value in (str(device.index), device.device_id)
+        }
         if available and not set(values).issubset(available):
             raise ValueError("选择中包含当前不可用的 GPU")
-        return values
+        indexes = {device.device_id: str(device.index) for device in devices}
+        return tuple(dict.fromkeys(indexes.get(value, value) for value in values))
 
     def login_required(view: F) -> F:
         @wraps(view)
@@ -214,15 +222,20 @@ def create_app(
         users = []
         for user in store.list_users():
             private_path = key_manager.private_key_path(user.username)
+            private_key = private_path.read_bytes() if private_path.is_file() else None
             users.append(
                 {
                     "record": user,
                     "status": docker_service.status(user.container_id),
+                    "gpu_ids": indexed_gpu_ids(user.gpu_ids),
                     "powershell": (
-                        powershell_command(
-                            user.username, hostname, private_path.read_bytes()
-                        )
-                        if private_path.is_file()
+                        powershell_command(user.username, hostname, private_key)
+                        if private_key is not None
+                        else ""
+                    ),
+                    "scp": (
+                        powershell_scp_command(user.username, hostname, private_key)
+                        if private_key is not None
                         else ""
                     ),
                 }
@@ -303,7 +316,7 @@ def create_app(
                             existing.image,
                             existing.container_id,
                             user_key.public_key,
-                            existing.gpu_ids,
+                            indexed_gpu_ids(existing.gpu_ids),
                         )
                     except (OSError, TypeError, ValueError) as exc:
                         logger.exception(
@@ -319,7 +332,7 @@ def create_app(
                         username,
                         existing.container_id,
                         stored_user is not None,
-                        existing.gpu_ids,
+                        indexed_gpu_ids(existing.gpu_ids),
                     )
                     flash(
                         f"已复用 {username} 的容器并重置 SSH 密钥，旧密钥立即失效",
@@ -344,6 +357,7 @@ def create_app(
                         username=username,
                         image=image,
                         instance=existing,
+                        existing_gpu_ids=indexed_gpu_ids(existing.gpu_ids),
                         gpu_ids=gpu_ids,
                     )
             elif stored_user is not None:
@@ -452,6 +466,7 @@ def create_app(
                 user=user,
                 gpu_devices=gpu_devices,
                 gpu_error=gpu_error,
+                current_gpu_ids=indexed_gpu_ids(user.gpu_ids),
             )
         try:
             gpu_ids = selected_gpu_ids()
@@ -469,7 +484,8 @@ def create_app(
                 ):
                     flash("用户配置与同名受管容器不匹配，无法修改 GPU", "error")
                     return redirect(url_for("dashboard"))
-                if existing.gpu_ids == gpu_ids:
+                existing_gpu_ids = indexed_gpu_ids(existing.gpu_ids)
+                if existing_gpu_ids == gpu_ids:
                     if user.gpu_ids != gpu_ids:
                         store.update_instance(username, existing.container_id, gpu_ids)
                     flash(f"{username} 的 GPU 分配没有变化", "success")
@@ -477,7 +493,7 @@ def create_app(
                 logger.warning(
                     "开始修改 GPU，容器将被重建 username=%s old_gpu_ids=%s new_gpu_ids=%s",
                     username,
-                    existing.gpu_ids,
+                    existing_gpu_ids,
                     gpu_ids,
                 )
                 container_id = docker_service.recreate_instance(
@@ -554,26 +570,6 @@ def create_app(
             as_attachment=True,
             download_name=f"id_ed25519_{username}",
             mimetype="application/octet-stream",
-        )
-
-    @app.get("/users/<username>/bundle")
-    @login_required
-    def download_bundle(username: str) -> Any:
-        require_user(store, username)
-        private_path = key_manager.private_key_path(username)
-        if not private_path.is_file():
-            abort(404)
-        payload = io.BytesIO()
-        hostname = store.public_hostname()
-        with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("id_ed25519", private_path.read_bytes())
-            archive.writestr("login.bat", batch_script(username, hostname))
-        payload.seek(0)
-        return send_file(
-            payload,
-            as_attachment=True,
-            download_name=f"docker-proxy-{username}.zip",
-            mimetype="application/zip",
         )
 
     @app.get("/healthz")

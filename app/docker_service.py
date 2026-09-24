@@ -24,6 +24,7 @@ class ExecConnection:
     exec_id: str
     socket: Any
     api: Any
+    tty: bool
 
 
 @dataclass(frozen=True)
@@ -439,23 +440,24 @@ class DockerService:
         term_size: tuple[int, int, int, int] | None,
     ) -> ExecConnection:
         api = self.client().api
+        tty = term_type is not None
         result = api.exec_create(
             container=container_id,
             cmd=command,
             stdin=True,
             stdout=True,
             stderr=True,
-            tty=True,
+            tty=tty,
             user="root",
             environment={"TERM": term_type or "xterm-256color"},
         )
         exec_id = result["Id"]
-        sock = api.exec_start(exec_id, tty=True, socket=True)
+        sock = api.exec_start(exec_id, tty=tty, socket=True)
         if term_size:
             width, height = term_size[0], term_size[1]
             if width and height:
                 api.exec_resize(exec_id, height=height, width=width)
-        return ExecConnection(exec_id, sock, api)
+        return ExecConnection(exec_id, sock, api, tty)
 
     def exec_exit_code(self, connection: ExecConnection) -> int:
         result = connection.api.exec_inspect(connection.exec_id)

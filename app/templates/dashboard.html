@@ -57,10 +57,10 @@
                     <div class="gpu-options">
                         {% for gpu in gpu_devices %}
                             <label class="gpu-option">
-                                <input type="checkbox" name="gpu_ids" value="{{ gpu.device_id }}" checked>
+                                <input type="checkbox" name="gpu_ids" value="{{ gpu.index }}" checked>
                                 <span>
                                     <strong>GPU {{ gpu.index }} · {{ gpu.name }}</strong>
-                                    <small>{{ gpu.memory_mb }} MiB · {{ gpu.device_id }}</small>
+                                    <small>编号 {{ gpu.index }} · {{ gpu.memory_mb }} MiB</small>
                                 </span>
                             </label>
                         {% endfor %}
@@ -109,12 +109,12 @@
                     <div class="data-path">
                         <span>GPU</span>
                         <code>
-                            {% if not user.gpu_ids %}
+                            {% if not item.gpu_ids %}
                                 未分配
-                            {% elif 'all' in user.gpu_ids %}
+                            {% elif 'all' in item.gpu_ids %}
                                 全部 GPU
                             {% else %}
-                                {{ user.gpu_ids|length }} 张 · {{ user.gpu_ids|join(', ') }}
+                                {{ item.gpu_ids|length }} 张 · GPU {{ item.gpu_ids|join(', GPU ') }}
                             {% endif %}
                         </code>
                     </div>
@@ -129,9 +129,18 @@
                         </div>
                     {% endif %}
 
+                    {% if item.scp %}
+                        <div class="command-block">
+                            <div class="command-head">
+                                <span>PowerShell 上传 FILE_NAME 到 /data</span>
+                                <button class="copy-button" type="button" data-copy-target="scp-{{ user.username }}">复制</button>
+                            </div>
+                            <code id="scp-{{ user.username }}">{{ item.scp }}</code>
+                        </div>
+                    {% endif %}
+
                     <div class="card-actions">
                         <a class="button button-secondary" href="{{ url_for('download_key', username=user.username) }}">下载私钥</a>
-                        <a class="button button-secondary" href="{{ url_for('download_bundle', username=user.username) }}">下载一键登录包</a>
                         <a class="button button-secondary" href="{{ url_for('configure_gpu', username=user.username) }}">修改 GPU</a>
                         {% if user.active %}
                             <form method="post" action="{{ url_for('start_user', username=user.username) }}">

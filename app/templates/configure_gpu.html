@@ -15,19 +15,19 @@
                     <div class="gpu-options">
                         {% for gpu in gpu_devices %}
                             <label class="gpu-option">
-                                <input type="checkbox" name="gpu_ids" value="{{ gpu.device_id }}" {{ 'checked' if gpu.device_id in user.gpu_ids or 'all' in user.gpu_ids }}>
+                                <input type="checkbox" name="gpu_ids" value="{{ gpu.index }}" {{ 'checked' if gpu.index|string in current_gpu_ids or 'all' in current_gpu_ids }}>
                                 <span>
                                     <strong>GPU {{ gpu.index }} · {{ gpu.name }}</strong>
-                                    <small>{{ gpu.memory_mb }} MiB · {{ gpu.device_id }}</small>
+                                    <small>编号 {{ gpu.index }} · {{ gpu.memory_mb }} MiB</small>
                                 </span>
                             </label>
                         {% endfor %}
                     </div>
                 {% else %}
                     <div class="gpu-summary gpu-error">{{ gpu_error or '未检测到 NVIDIA GPU' }}</div>
-                    {% if user.gpu_ids and 'all' not in user.gpu_ids %}
+                    {% if current_gpu_ids and 'all' not in current_gpu_ids %}
                         <div class="gpu-options">
-                            {% for gpu_id in user.gpu_ids %}
+                            {% for gpu_id in current_gpu_ids %}
                                 <label class="gpu-option">
                                     <input type="checkbox" name="gpu_ids" value="{{ gpu_id }}" checked>
                                     <span><strong>保留当前 GPU</strong><small>{{ gpu_id }}</small></span>
@@ -36,7 +36,7 @@
                         </div>
                     {% else %}
                         <label class="gpu-option">
-                            <input type="checkbox" name="gpu_ids" value="all" {{ 'checked' if 'all' in user.gpu_ids }}>
+                            <input type="checkbox" name="gpu_ids" value="all" {{ 'checked' if 'all' in current_gpu_ids }}>
                             <span><strong>全部可用 GPU</strong><small>由 NVIDIA Container Runtime 在启动时提供</small></span>
                         </label>
                     {% endif %}

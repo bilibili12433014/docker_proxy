@@ -11,7 +11,7 @@
         <div class="data-path"><span>容器 ID</span><code>{{ instance.container_id[:12] }}</code></div>
         <div class="data-path"><span>原镜像</span><code>{{ instance.image }}</code></div>
         <div class="data-path"><span>当前状态</span><code>{{ instance.status }}</code></div>
-        <div class="data-path"><span>现有 GPU</span><code>{{ instance.gpu_ids|join(', ') if instance.gpu_ids else '不分配 GPU' }}</code></div>
+        <div class="data-path"><span>现有 GPU</span><code>{% if 'all' in existing_gpu_ids %}全部 GPU{% elif existing_gpu_ids %}GPU {{ existing_gpu_ids|join(', GPU ') }}{% else %}不分配 GPU{% endif %}</code></div>
         <form method="post" action="{{ url_for('create_user') }}" class="form-stack">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" name="username" value="{{ username }}">
@@ -20,7 +20,7 @@
             <button class="button button-primary button-wide" type="submit">复用容器并重置 SSH 密钥</button>
         </form>
         <p class="muted action-explanation">复用会保留容器、可写层、运行状态和 GPU 分配，并在 YAML 中创建或修复该用户记录。</p>
-        <div class="data-path"><span>新 GPU 分配</span><code>{{ gpu_ids|join(', ') if gpu_ids else '不分配 GPU' }}</code></div>
+        <div class="data-path"><span>新 GPU 分配</span><code>{% if 'all' in gpu_ids %}全部 GPU{% elif gpu_ids %}GPU {{ gpu_ids|join(', GPU ') }}{% else %}不分配 GPU{% endif %}</code></div>
         <form method="post" action="{{ url_for('create_user') }}" class="form-stack">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" name="username" value="{{ username }}">
