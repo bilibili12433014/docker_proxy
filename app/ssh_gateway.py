@@ -196,10 +196,28 @@ def process_environment(process: asyncssh.SSHServerProcess[bytes]) -> dict[str, 
 
 
 class GatewaySSHServer(asyncssh.SSHServer):
-    def __init__(self, store: ConfigStore, forward_handler: Any):
+    def __init__(
+        self,
+        store: ConfigStore,
+        forward_handler: Any,
+        connection_opened: Any,
+        connection_closed: Any,
+    ):
         self.store = store
         self.forward_handler = forward_handler
+        self.connection_opened = connection_opened
+        self.connection_closed = connection_closed
         self.username = ""
+        self.connection: Any | None = None
+
+    def connection_made(self, conn: asyncssh.SSHServerConnection) -> None:
+        self.connection = conn
+        self.connection_opened(conn)
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        if self.connection is not None:
+            self.connection_closed(self.connection)
+            self.connection = None
 
     def begin_auth(self, username: str) -> bool:
         self.username = username
@@ -296,11 +314,21 @@ class SSHGateway:
         self.docker = docker_service
         self.key_manager = key_manager
         self._acceptor: Any | None = None
+        self._connections: set[Any] = set()
+        self._tasks: set[asyncio.Task[Any]] = set()
+        self._relays: set[asyncio.subprocess.Process] = set()
+        self._exec_connections: dict[str, ExecConnection] = {}
+        self._closing = False
 
     async def start(self, host: str, port: int) -> Any:
         host_key = self.key_manager.ensure_host_key()
         self._acceptor = await asyncssh.create_server(
-            lambda: GatewaySSHServer(self.store, self.forward_connection),
+            lambda: GatewaySSHServer(
+                self.store,
+                self.forward_connection,
+                self.connection_opened,
+                self.connection_closed,
+            ),
             host,
             port,
             server_host_keys=[str(host_key)],
@@ -319,10 +347,76 @@ class SSHGateway:
         )
         return self._acceptor
 
+    def connection_opened(self, connection: Any) -> None:
+        if self._closing:
+            connection.abort()
+            return
+        self._connections.add(connection)
+
+    def connection_closed(self, connection: Any) -> None:
+        self._connections.discard(connection)
+
+    def track_current_task(self) -> None:
+        task = asyncio.current_task()
+        if task is not None and task not in self._tasks:
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    @staticmethod
+    def kill_relay(relay: asyncio.subprocess.Process) -> None:
+        if relay.returncode is None:
+            try:
+                relay.kill()
+            except ProcessLookupError:
+                pass
+
     async def close(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
         if self._acceptor is not None:
             self._acceptor.close()
             await self._acceptor.wait_closed()
+            self._acceptor = None
+        connections = tuple(self._connections)
+        tasks = tuple(self._tasks)
+        relays = tuple(self._relays)
+        exec_connections = tuple(self._exec_connections.values())
+        logger.info(
+            "正在中断 SSH 服务 connections=%d tasks=%d relays=%d execs=%d",
+            len(connections),
+            len(tasks),
+            len(relays),
+            len(exec_connections),
+        )
+        for connection in connections:
+            connection.abort()
+        for relay in relays:
+            self.kill_relay(relay)
+        for connection in exec_connections:
+            try:
+                connection.socket.close()
+            except OSError:
+                pass
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if relays:
+            await asyncio.gather(
+                *(relay.wait() for relay in relays),
+                return_exceptions=True,
+            )
+        if connections:
+            await asyncio.gather(
+                *(connection.wait_closed() for connection in connections),
+                return_exceptions=True,
+            )
+        self._connections.clear()
+        self._tasks.clear()
+        self._relays.clear()
+        self._exec_connections.clear()
+        logger.info("SSH 服务及全部活动连接已中断")
 
     async def forward_connection(
         self,
@@ -334,6 +428,7 @@ class SSHGateway:
         reader: Any,
         writer: Any,
     ) -> None:
+        self.track_current_task()
         user = self.store.get_active_user(username)
         if (
             user is None
@@ -363,6 +458,7 @@ class SSHGateway:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            self._relays.add(relay)
             assert relay.stdin is not None
             assert relay.stdout is not None
             assert relay.stderr is not None
@@ -373,6 +469,14 @@ class SSHGateway:
                 ).strip()
                 await relay.wait()
                 raise OSError(detail or f"TCP relay 退出状态 {relay.returncode}")
+        except asyncio.CancelledError:
+            if "relay" in locals() and relay.returncode is None:
+                self.kill_relay(relay)
+                await relay.wait()
+            if "relay" in locals():
+                self._relays.discard(relay)
+            writer.close()
+            raise
         except (DockerException, OSError, ValueError, asyncio.TimeoutError) as exc:
             logger.exception(
                 "TCP 转发建立失败 username=%s destination=%s:%d error=%s",
@@ -382,8 +486,10 @@ class SSHGateway:
                 exc,
             )
             if "relay" in locals() and relay.returncode is None:
-                relay.kill()
+                self.kill_relay(relay)
                 await relay.wait()
+            if "relay" in locals():
+                self._relays.discard(relay)
             writer.close()
             return
         logger.info(
@@ -414,8 +520,9 @@ class SSHGateway:
                 try:
                     await asyncio.wait_for(relay.wait(), timeout=2)
                 except asyncio.TimeoutError:
-                    relay.kill()
+                    self.kill_relay(relay)
                     await relay.wait()
+            self._relays.discard(relay)
             writer.close()
         relay_detail = (await relay.stderr.read()).decode("utf-8", "replace").strip()
         if transfer_error or relay.returncode:
@@ -529,6 +636,7 @@ class SSHGateway:
             logger.exception("清理 SSH Agent 转发 socket 失败 path=%s", host_path)
 
     async def handle_process(self, process: asyncssh.SSHServerProcess[bytes]) -> None:
+        self.track_current_task()
         username = process.get_extra_info("username")
         user = self.store.get_active_user(username)
         if user is None:
@@ -577,6 +685,9 @@ class SSHGateway:
                 process.term_size,
                 environment,
             )
+        except asyncio.CancelledError:
+            await self.close_agent_bridge(agent_bridge)
+            raise
         except (DockerException, OSError, ValueError) as exc:
             logger.exception("无法为用户 %s 创建 Docker exec", username)
             await self.close_agent_bridge(agent_bridge)
@@ -589,6 +700,7 @@ class SSHGateway:
             connection.exec_id,
             command,
         )
+        self._exec_connections[connection.exec_id] = connection
         input_task = asyncio.create_task(
             self._copy_ssh_to_docker(
                 process,
@@ -609,6 +721,7 @@ class SSHGateway:
                 connection.socket.close()
             except OSError:
                 pass
+            self._exec_connections.pop(connection.exec_id, None)
             input_result = await asyncio.gather(input_task, return_exceptions=True)
             if input_result and isinstance(input_result[0], Exception) and not isinstance(
                 input_result[0], asyncio.CancelledError

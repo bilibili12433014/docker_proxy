@@ -77,6 +77,8 @@ python3 start.py
 LOG_LEVEL=DEBUG python3 start.py
 ```
 
+前台运行时按 `Ctrl+C` 会停止接受新连接，立即中断全部活动 SSH 会话、端口转发和 Docker Exec 连接，随后关闭管理页面并释放 `2221`、`2222` 端口。`SIGTERM` 使用相同的退出流程。
+
 ## 首次初始化
 
 启动后访问：
