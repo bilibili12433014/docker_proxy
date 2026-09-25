@@ -6,6 +6,9 @@ services:
     container_name: docker-proxy-manager
     restart: unless-stopped
     init: true
+    pid: host
+    cap_add:
+      - SYS_ADMIN
     ports:
       - "2221:2221"
       - "2222:2222"

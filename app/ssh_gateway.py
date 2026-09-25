@@ -8,6 +8,7 @@ import re
 import secrets
 import shlex
 import socket
+import sys
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -142,13 +143,6 @@ def tool_install(
 
 RSYNC_INSTALL = tool_install("rsync", "rsync", "rsync", "rsync", "rsync")
 GIT_INSTALL = tool_install("git-upload-pack", "git", "git", "git", "git")
-NC_INSTALL = tool_install(
-    "nc",
-    "netcat-openbsd",
-    "netcat-openbsd",
-    "nmap-ncat",
-    "openbsd-netcat",
-)
 ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -353,82 +347,96 @@ class SSHGateway:
         if status != "running":
             writer.close()
             return
-        command = [
-            "/bin/sh",
-            "-lc",
-            NC_INSTALL + f"exec nc {shlex.quote(dest_host)} {dest_port}",
-        ]
         try:
-            connection = await asyncio.to_thread(
-                self.docker.open_exec,
+            container_pid = await asyncio.to_thread(
+                self.docker.container_pid,
                 user.container_id,
-                command,
-                None,
-                None,
-                None,
             )
-        except (DockerException, OSError, ValueError):
+            relay = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-u",
+                str(Path(__file__).with_name("tcp_relay.py")),
+                str(container_pid),
+                dest_host,
+                str(dest_port),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            assert relay.stdin is not None
+            assert relay.stdout is not None
+            assert relay.stderr is not None
+            marker = await asyncio.wait_for(relay.stderr.readline(), timeout=15)
+            if marker != b"CONNECTED\n":
+                detail = (marker + await relay.stderr.read()).decode(
+                    "utf-8", "replace"
+                ).strip()
+                await relay.wait()
+                raise OSError(detail or f"TCP relay 退出状态 {relay.returncode}")
+        except (DockerException, OSError, ValueError, asyncio.TimeoutError) as exc:
             logger.exception(
-                "TCP 转发建立失败 username=%s destination=%s:%d",
+                "TCP 转发建立失败 username=%s destination=%s:%d error=%s",
                 username,
                 dest_host,
                 dest_port,
+                exc,
             )
+            if "relay" in locals() and relay.returncode is None:
+                relay.kill()
+                await relay.wait()
             writer.close()
             return
         logger.info(
-            "TCP 转发已连接 username=%s origin=%s:%d destination=%s:%d exec_id=%s",
+            "TCP 转发已连接 username=%s origin=%s:%d destination=%s:%d container_pid=%d relay_pid=%d",
             username,
             orig_host,
             orig_port,
             dest_host,
             dest_port,
-            connection.exec_id,
+            container_pid,
+            relay.pid,
         )
-        input_task = asyncio.create_task(
-            self._copy_forward_to_docker(reader, connection)
-        )
+        input_task = asyncio.create_task(self.copy_stream(reader, relay.stdin))
+        output_task = asyncio.create_task(self.copy_stream(relay.stdout, writer))
+        uploaded = 0
+        downloaded = 0
+        transfer_error = None
         try:
-            while True:
-                stream, data = await asyncio.to_thread(
-                    self._read_socket,
-                    connection,
-                    32768,
-                )
-                if not data:
-                    break
-                if stream == 1:
-                    writer.write(data)
-                    await writer.drain()
-                else:
-                    logger.debug(
-                        "TCP 转发容器错误输出 username=%s exec_id=%s message=%s",
-                        username,
-                        connection.exec_id,
-                        data.decode("utf-8", "replace").strip(),
-                    )
+            uploaded, downloaded = await asyncio.gather(input_task, output_task)
+        except Exception as exc:
+            transfer_error = exc
         finally:
             input_task.cancel()
-            await asyncio.gather(input_task, return_exceptions=True)
-            try:
-                connection.socket.close()
-            except OSError:
-                pass
+            output_task.cancel()
+            await asyncio.gather(input_task, output_task, return_exceptions=True)
+            relay.stdin.close()
+            if relay.returncode is None:
+                try:
+                    await asyncio.wait_for(relay.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    relay.kill()
+                    await relay.wait()
             writer.close()
-
-    @staticmethod
-    async def _copy_forward_to_docker(
-        reader: Any,
-        connection: ExecConnection,
-    ) -> None:
-        try:
-            while True:
-                data = await reader.read(32768)
-                if not data:
-                    return
-                await asyncio.to_thread(SSHGateway._write_all, connection.socket, data)
-        finally:
-            await asyncio.to_thread(SSHGateway._shutdown_write, connection.socket)
+        relay_detail = (await relay.stderr.read()).decode("utf-8", "replace").strip()
+        if transfer_error or relay.returncode:
+            logger.warning(
+                "TCP 转发异常结束 username=%s destination=%s:%d relay_exit=%s error=%r detail=%s",
+                username,
+                dest_host,
+                dest_port,
+                relay.returncode,
+                transfer_error,
+                relay_detail,
+            )
+        else:
+            logger.info(
+                "TCP 转发已结束 username=%s destination=%s:%d uploaded=%d downloaded=%d",
+                username,
+                dest_host,
+                dest_port,
+                uploaded,
+                downloaded,
+            )
 
     async def open_agent_bridge(
         self,
@@ -492,17 +500,19 @@ class SSHGateway:
             )
 
     @staticmethod
-    async def copy_stream(reader: Any, writer: Any) -> None:
+    async def copy_stream(reader: Any, writer: Any) -> int:
+        transferred = 0
         while True:
             data = await reader.read(32768)
             if not data:
                 try:
                     writer.write_eof()
-                except (AttributeError, OSError):
+                except (AttributeError, ConnectionError, NotImplementedError, OSError):
                     pass
-                return
+                return transferred
             writer.write(data)
             await writer.drain()
+            transferred += len(data)
 
     @staticmethod
     async def close_agent_bridge(

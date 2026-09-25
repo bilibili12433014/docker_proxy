@@ -424,6 +424,17 @@ class DockerService:
         except DockerException:
             return "unavailable"
 
+    def container_pid(self, container_id: str) -> int:
+        container = self.client().containers.get(container_id)
+        container.reload()
+        state = container.attrs.get("State") or {}
+        if not state.get("Running"):
+            raise DockerException(f"容器当前状态为 {state.get('Status') or 'unknown'}")
+        pid = int(state.get("Pid") or 0)
+        if pid <= 0:
+            raise DockerException("无法获取容器网络命名空间 PID")
+        return pid
+
     def start(self, container_id: str) -> None:
         container = self.client().containers.get(container_id)
         container.start()

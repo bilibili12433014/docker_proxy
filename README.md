@@ -122,7 +122,7 @@ ssh -p 2222 -i id_ed25519_<username> <username>@<服务器地址>
 
 SCP 命令以 `$file="FILE_NAME";` 开头，只需修改最前面的 `FILE_NAME` 即可指定待上传文件，目标固定为实例内的 `/data/`。命令不使用 `-O`，由新版 OpenSSH 的 `scp` 通过网关原生 SFTP 上传；内容直接写入宿主机 `/data/<username>`，不要求容器内安装 `scp`，容器停止时也可以上传。命令本身包含完整私钥，不应发送给其他人，也不应保存在共享终端历史中。
 
-SFTP、SCP 和 SSHFS 看到的 `/data` 与容器内 `/data` 对应同一个宿主机目录。`rsync`、Git over SSH 和 TCP 转发所需的工具若不在镜像中，会通过镜像的包管理器静默安装；`-L` 与 `-D` 的目标连接从用户容器内部发起，因此 `localhost` 指向该用户的容器。`-R` 只允许监听 SSH 网关主机的回环地址，避免把转发端口意外暴露到公网。
+SFTP、SCP 和 SSHFS 看到的 `/data` 与容器内 `/data` 对应同一个宿主机目录。`rsync` 和 Git over SSH 所需的工具若不在镜像中，会通过镜像的包管理器静默安装。`-L` 与 `-D` 由网关直接进入用户容器的网络命名空间建立连接，不依赖容器内安装 `nc`、`socat`、Python 或其他转发工具，因此 `localhost` 指向该用户的容器。宿主机直接运行 `start.py` 时需要 root 权限；Compose 已配置所需的宿主机 PID 视图和最小 capability。`-R` 只允许监听 SSH 网关主机的回环地址，避免把转发端口意外暴露到公网。
 
 客户端使用 `ssh -A` 时，网关会在该用户独占的 `/data` 中创建仅当前会话可用的隐藏 socket，并把它作为容器内的 `SSH_AUTH_SOCK`；SSH 会话结束后 socket 会立即删除。Agent 转发会让远端程序在连接存续期间使用客户端 agent，应只对可信实例启用。
 
